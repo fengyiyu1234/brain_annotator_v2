@@ -1,4 +1,5 @@
 # src/annotator.py
+#has navigation viewer, atlas overlay, region-based filtering, crop navigation, and search functionality.
 import os
 import numpy as np
 import tifffile
