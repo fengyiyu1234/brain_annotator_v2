@@ -18,12 +18,11 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from .config import (PIXEL_SIZE_RAW, PIXEL_SIZE_NAV_SAMPLE, TILE_SHAPE_PX)
+from .config import (PIXEL_SIZE_RAW, PIXEL_SIZE_NAV_SAMPLE, TILE_SHAPE_PX, PATCH_SIZE)
 from .utils import normalize_percentile
 from .widgets import OntologyTreeWidget
-
-# --- 核心配置 ---
-PATCH_SIZE = 256 
+from scipy.spatial import cKDTree
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QFormLayout # 确保引入了这些
 
 # --- 1. 双因子类别配置 (Two-Factor Configuration) ---
 
@@ -82,82 +81,61 @@ def init_worker(atlas_array):
     global_atlas = atlas_array
 
 # --- Worker 1: 索引 CSV ---
-
-def process_single_csv(task_data):
-    csv_path, t_idx, origin, res_raw, res_nav = task_data
-    results = {} 
-    
-    if global_atlas is None: return {}
-    if not os.path.exists(csv_path): return {}
-
+def process_single_csv(args):
+    """
+    独立 Worker 函数
+    Args:
+        args: tuple (file_path, tile_offsets_px)
+    """
+    file_path, tile_offsets_px, tile_idx = args
+    print(f"Processing CSV: {file_path}") # 调试时可以打开，生产环境建议注释以减少IO
     try:
-        # 读取 CSV
-        df = pd.read_csv(csv_path, header=None, usecols=[1,2,3,4,5,8],
-                         names=['x1', 'y1', 'x2', 'y2', 'cls', 'z'])
-        df = df.dropna(subset=['x1', 'y1', 'z'])
-    except Exception:
+        df = pd.read_csv(file_path, header=None, 
+                         names=['filename', 'x1', 'y1', 'x2', 'y2', 'cls', 'conf', 'intensity', 'z'])
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
         return {}
 
-    # --- 坐标转换 ---
-    z_local = df['z'].values - 1
-    cx_local = (df['x1'].values + df['x2'].values) / 2
-    cy_local = (df['y1'].values + df['y2'].values) / 2
+    results = {}
     
-    gz_um = origin[0] + z_local * res_raw[0]
-    gy_um = origin[1] + cy_local * res_raw[1]
-    gx_um = origin[2] + cx_local * res_raw[2]
-    
-    az = (gz_um / res_nav[0]).astype(int)
-    ay = (gy_um / res_nav[1]).astype(int)
-    ax = (gx_um / res_nav[2]).astype(int)
-    
-    max_z, max_y, max_x = global_atlas.shape
-    np.clip(az, 0, max_z-1, out=az)
-    np.clip(ay, 0, max_y-1, out=ay)
-    np.clip(ax, 0, max_x-1, out=ax)
-    
-    atlas_ids = global_atlas[az, ay, ax]
-    valid_mask = atlas_ids > 0
-    
-    if not np.any(valid_mask): return {}
+    for idx, row in df.iterrows():
+        fname = row['filename']
         
-    valid_df = df[valid_mask]
-    valid_ids = atlas_ids[valid_mask]
-    valid_z = z_local[valid_mask]
-    
-    # --- 结果收集 ---
-    for i, (idx, row) in enumerate(valid_df.iterrows()):
-        aid = int(valid_ids[i])
+        parts = fname.split('_')
+        off_x_px, off_y_px = 0.0, 0.0
         
-        # [核心修正] 智能解析 Class
-        raw_cls = row['cls']
-        cls_val = 0 # 默认值
+        if len(parts) >= 2:
+            key = f"{parts[0]}_{parts[1]}"
+            # 从字典获取，如果没有则默认为 (0,0)
+            if tile_offsets_px and key in tile_offsets_px:
+                off_x_px, off_y_px = tile_offsets_px[key]
         
-        # 1. 先尝试查字典 (处理 "yellow neuron")
-        # 去掉可能的空格并转小写，增加匹配成功率
-        clean_name = str(raw_cls).strip() 
+        # 计算全局像素坐标
+        gx = off_x_px + row['x1']
+        gy = off_y_px + row['y1']
         
-        if clean_name in NAME_TO_ID:
-            cls_val = NAME_TO_ID[clean_name]
-        else:
-            # 2. 如果字典里没有，尝试转数字 (处理 "5.0" 或 5)
-            try:
-                cls_val = int(float(raw_cls))
-            except (ValueError, TypeError):
-                # 如果既不是已知名字，也不是数字，跳过
-                print(f"Unknown class: {raw_cls}")
-                continue 
-
+        # 构建结果
+        aid = int(idx)
         if aid not in results: results[aid] = []
         
+        # 简单的类别映射
+        cls_name = str(row['cls']).strip().lower()
+        if 'green' in cls_name: cls_val = 1
+        elif 'yellow' in cls_name: cls_val = 2
+        else: cls_val = 0 # red
+        
         results[aid].append({
-            'tile_idx': t_idx,
-            'z': int(valid_z[i]),
+            'filename': fname,
+            'z': int(row['z']),
             'x1': row['x1'], 'y1': row['y1'],
             'x2': row['x2'], 'y2': row['y2'],
-            'cls': cls_val
+            'gx': gx,
+            'gy': gy,
+            'cls': cls_val,
+            'name': f"Cell {aid}",
+            'tile_idx': tile_idx
         })
-            
+        
     return results
 
 # --- Worker 2: 加载并切片 ---
@@ -197,12 +175,17 @@ def load_patches_worker(task_data):
                 'y1': c['y1'] - y1, 'y2': c['y2'] - y1
             }
             
-            patches.append({
+            # 创建结果字典，首先复制原始 cell (c) 的所有信息 (包含 gx, gy, x1, y1 等)
+            patch_item = c.copy()
+            # 然后覆盖/添加图像和框信息
+            patch_item.update({
                 'image': crop,
-                'boxes': [box_loc],
+                'boxes': [box_loc], # 这里暂时只存了中心这个框，show_patch 会重写它
                 'tile_idx': tile_idx,
                 'z': z
             })
+            patches.append(patch_item)
+
     except Exception as e:
         print(f"Error cutting patches: {e}")
         
@@ -212,15 +195,15 @@ class IndexerThread(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(dict, int)
     
-    def __init__(self, tiles, csv_root, atlas_array):
+    def __init__(self, tiles, csv_root, atlas_array, tile_offsets_px):
         super().__init__()
         self.tiles = tiles
         self.csv_root = csv_root
         self.atlas = atlas_array
+        self.tile_offsets_px = tile_offsets_px
         
     def run(self):
         tasks = []
-        # 确保 csv_root 存在
         if not os.path.exists(self.csv_root):
             print(f"[FATAL] CSV Root does not exist: {self.csv_root}")
             self.finished_signal.emit({}, 0)
@@ -232,21 +215,19 @@ class IndexerThread(QThread):
         for tile in self.tiles:
             t_idx = tile['list_index']
             base_name = tile['dir'].split('/')[-1]
-            
-            # 模糊匹配逻辑
             candidates = [f for f in files if base_name in f]
             if not candidates: 
-                # print(f"[DEBUG] No CSV found for tile {base_name}")
+                print(f"[DEBUG] No CSV found for tile {base_name}")
                 continue
             
             target_csv = candidates[0]
-            # 优先选择带 _result 的文件
             for c in candidates:
                 if "_result" in c: target_csv = c; break
             
             tasks.append((
                 os.path.join(self.csv_root, target_csv), 
-                t_idx, tile['origin_um'], PIXEL_SIZE_RAW, PIXEL_SIZE_NAV_SAMPLE
+                self.tile_offsets_px,
+                t_idx
             ))
             
         print(f"[DEBUG] Created {len(tasks)} indexing tasks.")
@@ -258,12 +239,10 @@ class IndexerThread(QThread):
         
         try:
             with ProcessPoolExecutor(max_workers=num_workers, initializer=init_worker, initargs=(self.atlas,)) as ex:
-                # 使用 future 对象来捕获子进程的异常
                 futures = {ex.submit(process_single_csv, t): t for t in tasks}
-                
                 for future in futures:
                     try:
-                        res = future.result() # 这里会重新抛出子进程的异常
+                        res = future.result() 
                         processed += 1
                         self.progress_signal.emit(processed)
                         
@@ -394,6 +373,22 @@ class SimpleAnnotator(QWidget):
         right_panel.setFixedWidth(320)
         r_lay = QVBoxLayout(right_panel)
         
+        self.info_panel = QWidget()
+        self.info_layout = QFormLayout()
+        self.info_panel.setLayout(self.info_layout)
+        
+        # 显示当前选中的类别
+        self.lbl_current_class = QLabel("None")
+        self.lbl_current_class.setStyleSheet("font-weight: bold; color: blue; font-size: 14px;")
+        self.info_layout.addRow("Selected Class:", self.lbl_current_class)
+        
+        # 显示当前坐标
+        self.lbl_coords = QLabel("-")
+        self.info_layout.addRow("Position (XYZ):", self.lbl_coords)
+        
+        # 将这个面板加到你的右侧布局 layout 中 (在按钮上方或下方)
+        r_lay.addWidget(self.info_panel)
+
         # 1. Filter
         filter_grp = QGroupBox("Filter View")
         f_lay = QVBoxLayout()
@@ -481,77 +476,129 @@ class SimpleAnnotator(QWidget):
         self.viewer.bind_key('a', prev_patch_callback)
         self.viewer.bind_key('s', save_patch_callback)
 
-    def modify_selection(self, viewer, factor, value):
+    def bind_layer_keys(self):
         """
-        核心逻辑：根据 Factor 修改选中 Box 的 ID
-        factor: 'color' (value=0,1,2) 或 'type' (value=0,3,6...)
+        每次 show_patch 生成新的 shapes_layer 后，
+        必须重新绑定针对该图层的快捷键 (删除、修改类别)。
         """
-        if not hasattr(self, 'shapes_layer'): return
-        sel_idx = list(self.shapes_layer.selected_data)
-        if not sel_idx:
-            self.viewer.text_overlay.text = "Select a box first!"
+        if self.shapes_layer is None:
             return
 
-        self.push_undo(None)
+        # --- 1. 绑定 Delete 键 (删除选中框) ---
+        def on_delete(layer):
+            layer.remove_selected()
         
+        on_delete.__name__ = "delete_selected"
+        self.shapes_layer.bind_key('Delete', on_delete)
+
+        # --- 2. 绑定数字键 (修改类别 1-6) ---
+        # 我们使用循环来绑定，这样代码更整洁
+        # 注意：label ID 是 0-5，键盘按键是 '1'-'6'
+        
+        for i in range(6):
+            key_char = str(i + 1) # 键盘上的 '1', '2'...
+            class_id = i          # 对应的 ID 0, 1...
+            
+            # 定义回调函数 (利用默认参数捕获当前的 class_id)
+            def change_cls(layer, cid=class_id):
+                self.update_class_of_selection(cid)
+            
+            # 必须给函数起个独立的名字，否则 Napari 会报错
+            change_cls.__name__ = f"set_class_{class_id}"
+            
+            # 绑定到当前图层
+            self.shapes_layer.bind_key(key_char, change_cls)
+            
+        print("Layer keys (Delete, 1-6) rebound to new layer.")
+
+    def on_box_select(self, event):
+        """
+        当在 Napari 画布上选中/取消选中框时触发。
+        功能：更新右侧面板的 Label，显示当前选中的细胞类别。
+        """
+        # 获取当前被选中的框的索引集合
+        selected_indices = list(self.shapes_layer.selected_data)        
+        # 1. 如果没选中任何东西
+        if len(selected_indices) == 0:
+            self.lbl_current_class.setText("None")
+            return            
+        # 2. 如果选中了多个
+        if len(selected_indices) > 1:
+            self.lbl_current_class.setText(f"Multiple ({len(selected_indices)})")
+            return            
+        # 3. 如果只选中了一个 (显示详情)
+        idx = selected_indices[0]
+        current_cls = self.shapes_layer.properties['class_id'][idx]
+        ID_TO_NAME = {v: k for k, v in NAME_TO_ID.items()}
+        cls_name = ID_TO_NAME.get(int(current_cls), str(current_cls))
+
+        self.lbl_current_class.setText(f"{cls_name} (ID: {current_cls})")
+
+    def update_class_of_selection(self, new_class_id):
+        """
+        当你按下数字键 (1, 2, 3...) 时调用此函数。
+        功能：修改当前选中框的类别 ID，并立即更新颜色和 UI。
+        """
+        selected_indices = list(self.shapes_layer.selected_data)
+        if not selected_indices: 
+            print("No box selected.")
+            return
+        color_map = {0: 'red', 1: 'green', 2: 'yellow', 3: 'magenta', 4: 'cyan', 5: 'blue'}
+        new_color = color_map.get(new_class_id, 'white')
+        # --- 核心修改步骤 ---
+        # 1. 更新数据属性 (Properties)
         current_props = self.shapes_layer.properties
-        current_edge = self.shapes_layer.edge_color
+        for idx in selected_indices:
+            current_props['class_id'][idx] = new_class_id        
+        # 必须重新赋值 properties 才能触发 Napari 内部更新
+        self.shapes_layer.properties = current_props        
+        # 2. 立即更新边框颜色 (Visuals)
+        # Napari 的 edge_color 是一个 numpy 数组，直接修改对应索引的颜色
+        current_colors = self.shapes_layer.edge_color
+        for idx in selected_indices:
+            current_colors[idx] = str(new_color) # 或者转换成 RGBA            
+        # 强制刷新颜色
+        self.shapes_layer.edge_color = current_colors
+        self.shapes_layer.refresh()        
+        # 3. 更新 UI 反馈
+        ID_TO_NAME = {v: k for k, v in NAME_TO_ID.items()}
+        cls_name = ID_TO_NAME.get(new_class_id, str(new_class_id))
+        self.lbl_current_class.setText(f"{cls_name} (ID: {new_class_id}) [SAVED]")
         
-        count = 0
-        for idx in sel_idx:
-            old_id = int(current_props['class_id'][idx])
-            
-            # 反解当前状态 (ID = Base + Offset)
-            # Base = (ID // 3) * 3
-            # Offset = ID % 3
-            cur_base = (old_id // 3) * 3
-            cur_offset = old_id % 3
-            
-            new_id = old_id
-            
-            if factor == 'color':
-                # 只改 offset，保持 base 不变
-                new_id = cur_base + value
-            elif factor == 'type':
-                # 只改 base，保持 offset 不变
-                new_id = value + cur_offset
-                
-            # 获取新配置
-            cfg = CLASS_CONFIG.get(new_id)
-            if not cfg:
-                print(f"Warning: Calculated ID {new_id} not in config.")
-                continue
-                
-            # Update Layer Properties
-            current_props['class_id'][idx] = new_id
-            current_props['label'][idx] = cfg['name']
-            current_edge[idx] = list(np.array(COLOR_DICT.get(cfg['color'])))+[1.0]
-            
-            # Update Internal Data
-            self.current_patches[self.current_idx]['boxes'][idx]['cls'] = new_id
-            count += 1
-            
-        self.shapes_layer.properties = current_props
-        self.shapes_layer.edge_color = current_edge
-        self.shapes_layer.refresh()
-        self.shapes_layer.refresh_text()
-        
-        self.viewer.text_overlay.text = f"Updated {count} boxes."
+        print(f"Updated {len(selected_indices)} cells to class {new_class_id}")
 
     # --- Standard Methods (Same as before) ---
     def start_indexing(self):
         self.pd = QProgressDialog("Indexing...", "Cancel", 0, len(self.coord_sys.tiles), self)
         self.pd.setWindowModality(Qt.WindowModal)
         self.pd.show()
-        self.idx_worker = IndexerThread(self.coord_sys.tiles, self.csv_root, self.atlas)
+        self.idx_worker = IndexerThread(self.coord_sys.tiles, self.csv_root, self.atlas, self.coord_sys.tile_offsets_px)
         self.idx_worker.progress_signal.connect(self.pd.setValue)
         self.idx_worker.finished_signal.connect(self.indexing_done)
         self.idx_worker.start()
+
+    def build_spatial_index(self, all_cells_list):
+        print("Building KDTree (Global Microns)...")
+        # 使用 gx, gy (全局微米) 构建树
+        self.coords_array = np.array([[c['gx'], c['gy']] for c in all_cells_list]) 
+        self.cell_data_db = all_cells_list 
+        self.tree = cKDTree(self.coords_array)
+        print("KDTree built.")
 
     def indexing_done(self, idx_data, count):
         self.pd.close()
         self.region_index = idx_data
         self.lbl_info.setText(f"Ready. Indexed {count} cells.")
+        # --- 构建 KDTree ---
+        # 1. 把字典里的细胞全部提取到一个大列表里
+        all_cells = []
+        for region_id, cells in idx_data.items():
+            all_cells.extend(cells)
+
+        if all_cells:
+            self.build_spatial_index(all_cells)
+        else:
+            print("No cells indexed, skipping KDTree build.")
 
     def on_region_selected(self, rid, rname):
         self.lbl_info.setText(f"Querying {rname}...")
@@ -600,14 +647,92 @@ class SimpleAnnotator(QWidget):
             row += 1
 
     def show_patch(self):
-        if not self.current_patches: 
-            self.viewer.layers.clear(); return
-        data = self.current_patches[self.current_idx]
-        self.viewer.layers.clear()
-        self.viewer.add_image(data['image'], name='image')
-        self.refresh_layer_view()
+        """
+        [调试版] 假设 gx, gy 就是全局像素坐标，不除以分辨率。
+        """
+        if not self.current_patches: return
+        
+        target = self.current_patches[self.current_idx]
+        
+        center_gx = target['gx']
+        center_gy = target['gy']
+        
+        search_radius = PATCH_SIZE / 2 + 50 
+        
+        # 注意：如果 build_spatial_index 用的是 gx/gy，这里单位必须一致
+        indices = self.tree.query_ball_point([center_gx, center_gy], r=search_radius)
+        
+        layer_boxes = []
+        layer_classes = []
+        layer_colors = []
+        all_box_dicts = [] 
+        
+        color_map = {0: 'red', 1: 'green', 2: 'yellow', 3: 'magenta', 4: 'cyan', 5: 'blue'}
+        
+        # Patch 中心 (256 / 2 = 128)
+        patch_center_px = PATCH_SIZE / 2
+        
+        print(f"--- Debug Patch {self.current_idx} ---")
+        print(f"Center Global: {center_gx:.1f}, {center_gy:.1f}")
+
+        for i, idx in enumerate(indices):
+            cell = self.cell_data_db[idx]
+            if cell['z'] != target['z']: continue
+            delta_x = cell['gx'] - center_gx
+            delta_y = cell['gy'] - center_gy
+            cx_local = patch_center_px + delta_x
+            cy_local = patch_center_px + delta_y
+            
+            #计算 Box 宽高 (假设 x1, x2 是像素)
+            w_px = cell['x2'] - cell['x1']
+            h_px = cell['y2'] - cell['y1']
+            
+            x1_loc = cx_local - w_px / 2
+            x2_loc = cx_local + w_px / 2
+            y1_loc = cy_local - h_px / 2
+            y2_loc = cy_local + h_px / 2
+            
+            # 5. 边界过滤 (保留部分在视野内的)
+            if x2_loc < 0 or x1_loc > PATCH_SIZE or y2_loc < 0 or y1_loc > PATCH_SIZE:
+                continue
+
+            # Napari 格式: [[y1, x1], [y2, x2]]
+            layer_boxes.append([[y1_loc, x1_loc], [y2_loc, x2_loc]])
+            layer_classes.append(cell['cls'])
+            layer_colors.append(color_map.get(cell['cls'], 'white'))
+            
+            all_box_dicts.append({
+                'cls': cell['cls'],
+                'x1': x1_loc, 'y1': y1_loc,
+                'x2': x2_loc, 'y2': y2_loc
+            })
+
+        self.current_patches[self.current_idx]['boxes'] = all_box_dicts
+
+        # Napari 更新
+        self.viewer.layers.select_all()
+        self.viewer.layers.remove_selected()
+        
+        self.image_layer = self.viewer.add_image(target['image'], name='Patch Image')
+        
+        if layer_boxes:
+            self.shapes_layer = self.viewer.add_shapes(
+                layer_boxes,
+                shape_type='rectangle',
+                edge_width=2,
+                edge_color=layer_colors,
+                face_color=[0,0,0,0],
+                properties={'class_id': layer_classes}, 
+                name='boxes'
+            )
+            self.shapes_layer.events.highlight.connect(self.on_box_select)
+            self.shapes_layer.events.data.connect(self.push_undo) 
+            self.bind_layer_keys()
+        else:
+            self.shapes_layer = None
+
         self.lbl_counter.setText(f"{self.current_idx + 1} / {len(self.current_patches)}")
-        self.viewer.text_overlay.text = data['name']
+        self.lbl_coords.setText(f"GX:{int(center_gx)} GY:{int(center_gy)}")
 
     def refresh_layer_view(self):
         if not self.current_patches: return
@@ -637,7 +762,9 @@ class SimpleAnnotator(QWidget):
             
         try: self.viewer.layers.remove('boxes')
         except: pass
-        if not shapes: return
+        if not shapes: 
+            self.shapes_layer = None
+            return
 
         self.shapes_layer = self.viewer.add_shapes(
             shapes, shape_type='rectangle', edge_width=2, edge_color=edges,
@@ -645,7 +772,9 @@ class SimpleAnnotator(QWidget):
             text={'string': '{label}', 'color': 'white', 'anchor': 'upper_left', 'translation': [-5, 0], 'size': 8},
             properties={'label': labels, 'class_id': classes}
         )
+        self.shapes_layer.events.highlight.connect(self.on_box_select)
         self.shapes_layer.events.data.connect(self.push_undo)
+        self.bind_layer_keys()
 
     def push_undo(self, event):
         if not self.current_patches: return
@@ -670,27 +799,80 @@ class SimpleAnnotator(QWidget):
         data = self.current_patches[self.current_idx]
         base = data['name']
         
-        # Sync from layer
-        new_boxes = []
-        if hasattr(self, 'shapes_layer'):
-            for i, box in enumerate(self.shapes_layer.data):
-                ys, xs = box[:, 0], box[:, 1]
-                new_boxes.append({
-                    'cls': self.shapes_layer.properties['class_id'][i],
-                    'x1': min(xs), 'y1': min(ys), 'x2': max(xs), 'y2': max(ys)
-                })
-        data['boxes'] = new_boxes
+        # 1. 保存图片
+        # 确保目录存在
+        img_save_dir = os.path.join(self.save_root, 'images')
+        lbl_save_dir = os.path.join(self.save_root, 'labels')
+        os.makedirs(img_save_dir, exist_ok=True)
+        os.makedirs(lbl_save_dir, exist_ok=True)
+
+        cv2.imwrite(os.path.join(img_save_dir, base+'.jpg'), cv2.cvtColor(data['image'], cv2.COLOR_RGB2BGR))
         
-        cv2.imwrite(os.path.join(self.save_root, 'images', base+'.jpg'), cv2.cvtColor(data['image'], cv2.COLOR_RGB2BGR))
+        # 2. 从 Napari 图层获取最新的框 (用户可能修改过)
+        # 如果没有图层，说明没有框，或者被用户删光了
+        current_boxes = []
+        current_classes = []
+        
+        if hasattr(self, 'shapes_layer') and self.shapes_layer is not None:
+            # shapes_layer.data 返回的是 [[y1, x1], [y2, x2]] 格式
+            current_boxes = self.shapes_layer.data
+            current_classes = self.shapes_layer.properties['class_id']
         
         lines = []
-        for b in new_boxes:
-            cx = (b['x1'] + b['x2']) / 2 / PATCH_SIZE
-            cy = (b['y1'] + b['y2']) / 2 / PATCH_SIZE
-            w = (b['x2'] - b['x1']) / PATCH_SIZE
-            h = (b['y2'] - b['y1']) / PATCH_SIZE
-            lines.append(f"{b['cls']} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+        for i, box in enumerate(current_boxes):
+            cls_id = current_classes[i]
             
-        with open(os.path.join(self.save_root, 'labels', base+'.txt'), 'w') as f:
+            # Napari data is [[y1, x1], [y2, x2], [y2, x1], [y1, x2]] ... (4 points)
+            # 或者 [[y1, x1], [y2, x2]] (2 points)取决于形状类型
+            # 最稳健的方法是取 min/max
+            ys = box[:, 0]
+            xs = box[:, 1]
+            
+            x1 = min(xs)
+            y1 = min(ys)
+            x2 = max(xs)
+            y2 = max(ys)
+            
+            # 1. 计算原始中心点 (未切断前)
+            raw_cx = (x1 + x2) / 2
+            raw_cy = (y1 + y2) / 2
+            
+            # 2. 规则：如果中心点完全在图片外，丢弃 (防止邻居 Patch 重复训练)
+            if raw_cx < 0 or raw_cx > PATCH_SIZE or raw_cy < 0 or raw_cy > PATCH_SIZE:
+                continue
+
+            # 3. 规则：坐标截断 (Clip) 到 [0, PATCH_SIZE]
+            # YOLO 格式不允许负数或大于1的数
+            x1 = max(0, min(PATCH_SIZE, x1))
+            y1 = max(0, min(PATCH_SIZE, y1))
+            x2 = max(0, min(PATCH_SIZE, x2))
+            y2 = max(0, min(PATCH_SIZE, y2))
+            
+            # 4. 规则：防止退化 (比如 x1=x2，宽度为0)
+            if x2 <= x1 or y2 <= y1:
+                continue
+                
+            # --- 转换为 YOLO 格式 (Normalized Center X, Y, W, H) ---
+            final_w = x2 - x1
+            final_h = y2 - y1
+            final_cx = x1 + final_w / 2
+            final_cy = y1 + final_h / 2
+            
+            # 归一化 (除以 256)
+            norm_cx = final_cx / PATCH_SIZE
+            norm_cy = final_cy / PATCH_SIZE
+            norm_w = final_w / PATCH_SIZE
+            norm_h = final_h / PATCH_SIZE
+            
+            # 必须限制在 0-1 之间 (浮点数精度误差可能导致 1.000001)
+            norm_cx = min(max(norm_cx, 0), 1)
+            norm_cy = min(max(norm_cy, 0), 1)
+            norm_w = min(max(norm_w, 0), 1)
+            norm_h = min(max(norm_h, 0), 1)
+            
+            lines.append(f"{cls_id} {norm_cx:.6f} {norm_cy:.6f} {norm_w:.6f} {norm_h:.6f}")
+            
+        with open(os.path.join(lbl_save_dir, base+'.txt'), 'w') as f:
             f.write("\n".join(lines))
-        self.viewer.text_overlay.text = f"Saved {base}!"
+            
+        self.viewer.text_overlay.text = f"Saved {base}! ({len(lines)} boxes)"
