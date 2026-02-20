@@ -1,6 +1,12 @@
-from PyQt5.QtWidgets import QWidget, QDialog, QGridLayout, QPushButton, QLabel, QLineEdit, QFileDialog, QDialogButtonBox
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, 
+                             QTreeWidgetItemIterator, QGridLayout, QPushButton) # <--- [新增] QTreeWidgetItemIterator
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont
 import os
+
+# =========================================================
+# TileMapWidget (保持不变)
+# =========================================================
 class TileMapWidget(QWidget):
     tile_clicked = pyqtSignal(int)
     def __init__(self, tiles_meta):
@@ -16,6 +22,8 @@ class TileMapWidget(QWidget):
 
         rows = [t['row'] for t in self.tiles_meta]
         cols = [t['col'] for t in self.tiles_meta]
+        if not rows or not cols: return
+        
         min_r, min_c = min(rows), min(cols)
         
         for i, t in enumerate(self.tiles_meta):
@@ -27,104 +35,53 @@ class TileMapWidget(QWidget):
             layout.addWidget(btn, r, c)
             self.buttons[i] = btn
 
-    def update_visuals(self, current_idx, cached_keys):
-        for i, btn in self.buttons.items():
-            if i == current_idx:
-                btn.setStyleSheet("background-color: #ff3333; color: white; font-weight: bold; border: 2px solid black; font-size: 10px;")
-            elif i in cached_keys:
-                btn.setStyleSheet("background-color: #66cc66; color: white; border: 1px solid #336633; font-size: 10px;")
+    def update_visuals(self, current_idx):
+        for idx, btn in self.buttons.items():
+            if idx == current_idx:
+                btn.setStyleSheet("background-color: yellow; border: 2px solid red; font-weight: bold;")
             else:
-                btn.setStyleSheet("background-color: #ddd; color: black; border: 1px solid #999; font-size: 10px;")
+                btn.setStyleSheet("background-color: #ddd; border: 1px solid #999;")
 
-class SetupDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Brain Annotator Setup")
-        self.init_ui()
-        
-    def init_ui(self):
-        l = QGridLayout(self)
-        self.idx = 0
-        
-        # --- 新增 Ontology 选项 ---
-        self.ont = self.row(l, "Ontology (*.json):", "Z:/Fengyi/brain_analysis_6sample/CCF_v3_ontology.json", "f", "*.json")
-        self.xml = self.row(l, "XML:", "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm/xml_merging.xml", "f", "*.xml")
-        self.red = self.row(l, "Red Root:", "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm", "d")
-        self.grn = self.row(l, "Green Root:", "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/numorph_align/aligned/GFP", "d")
-        self.csv = self.row(l, "CSV Root:", "Z:/Fengyi/brain_analysis_6sample/detection_results/fw2/detection_results", "d")
-        self.nav = self.row(l, "Nav Sample:", "Z:/Fengyi/brain_analysis_6sample/clearmap_results/fw2/resampled.tif", "f", "*.tif")
-        self.atl = self.row(l, "Nav Atlas:", "Z:/Fengyi/brain_analysis_6sample/clearmap_results/fw2/volume/result.mhd", "f", "*.mhd")
-        self.sav = self.row(l, "Save Dir:", "Z:/Fengyi/brain_analysis_6sample/re_classify/fw2", "d")
-        
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        l.addWidget(btns, self.idx, 0, 1, 3)
-
-    def row(self, l, label, default, mode, filter=""):
-        l.addWidget(QLabel(label), self.idx, 0)
-        le = QLineEdit(default)
-        l.addWidget(le, self.idx, 1)
-        btn = QPushButton("...")
-        btn.clicked.connect(lambda: self.browse(le, mode, filter))
-        l.addWidget(btn, self.idx, 2)
-        self.idx += 1
-        return le
-
-    def browse(self, le, mode, filter):
-        if mode == "d":
-            path = QFileDialog.getExistingDirectory(self, "Select Directory", le.text())
-        else:
-            path, _ = QFileDialog.getOpenFileName(self, "Select File", le.text(), filter)
-        if path: le.setText(path)
-
-    def data(self):
-        # 返回参数列表，确保这里的顺序与 BrainAnnotator.__init__ 的参数顺序完全一致
-        return (
-            self.ont.text(),  self.xml.text(),  self.red.text(), self.grn.text(), self.csv.text(), self.nav.text(), self.atl.text(), self.sav.text()
-        )
-
-from PyQt5.QtWidgets import (QTreeWidget, QTreeWidgetItem, QHeaderView, 
-                             QLineEdit, QVBoxLayout, QWidget, QLabel)
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QBrush
+# =========================================================
+# OntologyTreeWidget (添加了 update_counts 方法)
+# =========================================================
 class OntologyTreeWidget(QWidget):
-    # 当用户点击某个脑区时发送信号 (region_id, region_name)
-    region_selected = pyqtSignal(int, str)
-
     def __init__(self, ontology):
         super().__init__()
         self.ontology = ontology
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
         
-        # 1. 顶部增加一个简单的过滤器
-        self.txt_filter = QLineEdit()
-        self.txt_filter.setPlaceholderText("Filter regions...")
-        self.txt_filter.textChanged.connect(self.filter_tree)
-        layout.addWidget(self.txt_filter)
-
-        # 2. 树状视图
+        # 布局初始化
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 树控件
         self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
-        self.tree.itemClicked.connect(self.on_item_clicked)
-        layout.addWidget(self.tree)
+        self.tree.setHeaderLabel("Brain Regions")
+        self.layout.addWidget(self.tree)
         
-        # 3. 填充数据
         self.populate_tree()
-
+        
     def populate_tree(self):
+        """初始化树结构"""
         root_node = self.ontology.tree_data
-        root_item = self.create_item(root_node)
-        self.tree.addTopLevelItem(root_item)
-        root_item.setExpanded(True)
+        # 处理 tree_data 可能是列表或单个字典的情况
+        if isinstance(root_node, list):
+            for node in root_node:
+                root_item = self.create_item(node)
+                self.tree.addTopLevelItem(root_item)
+                root_item.setExpanded(True)
+        else:
+            root_item = self.create_item(root_node)
+            self.tree.addTopLevelItem(root_item)
+            root_item.setExpanded(True)
 
     def create_item(self, node_data):
+        """递归创建树节点"""
         # 显示格式: "Name (Acronym)"
-        display_text = f"{node_data['name']} ({node_data['acronym']})"
+        name = node_data.get('name', 'Unknown')
+        acronym = node_data.get('acronym', '')
+        display_text = f"{name} ({acronym})"
+        
         item = QTreeWidgetItem([display_text])
         
         # 存储 Atlas ID 到 UserRole，以便点击时获取
@@ -133,9 +90,8 @@ class OntologyTreeWidget(QWidget):
         # 设置颜色 (JSON里通常有 color_hex_triplet: "AABBCC")
         if 'color_hex_triplet' in node_data:
             hex_color = f"#{node_data['color_hex_triplet']}"
-            # 设置前面小方块的颜色或者文字颜色
             item.setForeground(0, QBrush(QColor(hex_color)))
-            # 也可以设置字体加粗
+            # 设置字体加粗
             font = QFont()
             font.setBold(True)
             item.setFont(0, font)
@@ -148,14 +104,39 @@ class OntologyTreeWidget(QWidget):
                 
         return item
 
-    def on_item_clicked(self, item, col):
-        region_id = item.data(0, Qt.UserRole)
-        name = item.text(0)
-        self.region_selected.emit(region_id, name)
-
-    def filter_tree(self, text):
-        # 简单的过滤逻辑：隐藏不匹配的节点
-        # 注意：树状结构过滤比较复杂，通常只要父节点匹配就显示，
-        # 这里做一个简单的实现：展开并高亮，或者简单地利用 Qt 的 match
-        # 为了性能和简单，这里仅作为保留接口，暂不实现复杂的递归过滤显示
-        pass
+    # --- [新增] 核心修复方法 ---
+    def update_counts(self, region_map):
+        """
+        根据匹配结果更新树状图的显示 (Name + Count)
+        region_map: dict { graph_order: [cell_list] }
+        """
+        # 必须使用 QTreeWidgetItemIterator 遍历所有节点（包括折叠的）
+        iterator = QTreeWidgetItemIterator(self.tree)
+        while iterator.value():
+            item = iterator.value()
+            node_id = item.data(0, Qt.UserRole)
+            
+            # 从 Ontology 对象反查节点详细信息，获取 graph_order
+            node = self.ontology.id_map.get(node_id)
+            
+            count = 0
+            if node and 'graph_order' in node:
+                go = node['graph_order']
+                if go in region_map:
+                    count = len(region_map[go])
+            
+            # 更新文本
+            if node:
+                base_name = node.get('name', 'Unknown')
+                acronym = node.get('acronym', '')
+                
+                # 如果有细胞匹配到该区域，显示数量并高亮
+                if count > 0:
+                    item.setText(0, f"{base_name} ({acronym}) [{count}]")
+                    # 也可以选择自动展开
+                    # item.setExpanded(True)
+                else:
+                    # 如果没有细胞，恢复原始文本
+                    item.setText(0, f"{base_name} ({acronym})")
+            
+            iterator += 1

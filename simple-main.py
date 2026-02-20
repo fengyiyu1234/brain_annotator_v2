@@ -1,51 +1,61 @@
 import sys
 import os
-from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog
-from src.widgets import SetupDialog
+from PyQt5.QtWidgets import QApplication
+
+# 引入我们写好的模块
 from src.simple_annotator import SimpleAnnotator
 from src.coordinate_system import CoordinateSystem
 from src.ontology import Ontology
 
+# ================= 配置区域 (请确认你的默认路径) =================
+
+XML_PATH = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm/xml_merging.xml"
+ONTOLOGY_PATH = "Z:/Fengyi/brain_analysis_6sample/CCF_v3_ontology.json" 
+ROOT_RED = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm"
+ROOT_GREEN = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/numorph_align/aligned/GFP"
+
+# 存放 Detection (9列) 结果的文件夹
+DET_CSV_DIR = "Z:/Fengyi/brain_analysis_6sample/detection_results/fw2/detection_results" 
+
+# 存放 Registration (包含 graph order 的全局坐标) 的文件夹
+REG_CSV_DIR = r"Z:\Fengyi\brain_analysis_6sample\clearmap_p5_trimmed_atlas\fw2\cell_registration"
+
+# 重新分类后，保存 Patch 图像和 YOLO txt 的根目录
+SAVE_ROOT = "Z:/Fengyi/brain_analysis_6sample/re_classify/fw2"
+
+# ===================================================================
+
 def main():
     app = QApplication(sys.argv)
+
+    # 1. 检查关键文件是否存在
+    if not os.path.exists(XML_PATH):
+        print(f"Error: XML not found at {XML_PATH}")
+        return
+    if not os.path.exists(ONTOLOGY_PATH):
+        print(f"Error: Ontology not found at {ONTOLOGY_PATH}")
+        return
+
+    print("--- Loading Metadata ---")
     
-    # 1. 弹出配置 (或者你直接写死路径)
-    setup = SetupDialog()
-    if setup.exec_() == QDialog.Accepted:
-        params = setup.data() 
-        # params: ontology_path, xml_path, red, green, csv, nav_sample, nav_atlas, save
-        
-        ontology_path = params[0]
-        xml_path = params[1]
-        root_red = params[2]
-        root_green = params[3]
-        csv_root = params[4]
-        # skip nav_sample (params[5])
-        nav_atlas_path = params[6]
-        save_root = params[7]
-        
-        # 确保保存目录存在
-        os.makedirs(os.path.join(save_root, 'images'), exist_ok=True)
-        os.makedirs(os.path.join(save_root, 'labels'), exist_ok=True)
-        
-        # 初始化基础数据
-        print("Initializing Systems...")
-        coord = CoordinateSystem(xml_path)
-        onto = Ontology(ontology_path)
-        
-        # 启动极简标注器
-        annotator = SimpleAnnotator(
-            coord_sys=coord,
-            ontology=onto,
-            root_red=root_red,
-            root_green=root_green,
-            csv_root=csv_root,
-            nav_atlas_path=nav_atlas_path,
-            save_root=save_root
-        )
-        annotator.show()
-        
-        sys.exit(app.exec_())
+    # 2. 初始化基础数据 (坐标系统和脑区树)
+    coord_sys = CoordinateSystem(XML_PATH)
+    ontology = Ontology(ONTOLOGY_PATH)
+
+    print("--- Starting Annotator ---")
+    
+    # 3. 启动主程序 (将所有路径直接喂给全新的 Annotator)
+    window = SimpleAnnotator(
+        coord_sys=coord_sys,
+        ontology=ontology,
+        det_dir=DET_CSV_DIR,
+        reg_dir=REG_CSV_DIR,
+        save_root=SAVE_ROOT,
+        root_red=ROOT_RED,
+        root_green=ROOT_GREEN
+    )
+    window.show()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()

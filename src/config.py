@@ -2,34 +2,37 @@
 import numpy as np
 
 # --- Parameters ---
-# Resolution: Z, Y, X (um)
-PIXEL_SIZE_RAW = (20.0, 0.65, 0.65)   
-PIXEL_SIZE_NAV_SAMPLE = (25.0, 25.0, 25.0) 
+PATCH_SIZE = 256
+TILE_SHAPE_PX = (2048, 2048) 
 
-# Calculated Scaling Factors (Global to Raw)
-# Example: 1 px in Nav (25um) = ~38.4 px in Raw (0.65um)
-SCALE_FACTOR_Z = PIXEL_SIZE_NAV_SAMPLE[0] / PIXEL_SIZE_RAW[0]
-SCALE_FACTOR_Y = PIXEL_SIZE_NAV_SAMPLE[1] / PIXEL_SIZE_RAW[1]
-SCALE_FACTOR_X = PIXEL_SIZE_NAV_SAMPLE[2] / PIXEL_SIZE_RAW[2]
+TYPE_SHORTCUTS = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U']
+COLOR_SHORTCUTS = ['1', '2', '3', '4']
 
-TILE_SHAPE_PX = (2048, 2048)          
-CROP_SHAPE_PX = (256, 256) # New crop size
-CACHE_LIMIT_GB = 200 
-
-# --- Colors & Classes ---
-COLOR_MAP = {
-    'red':     (1, 0, 0, 1),
-    'green':   (0, 1, 0, 1),
-    'yellow':  (1, 1, 0, 1),
-    'cyan':    (0, 1, 1, 1),
-    'magenta': (1, 0, 1, 1), 
-    'blue':    (0, 0.6, 1, 1),
-    'white':   (1, 1, 1, 1)   
+# --- Classes Configuration ---
+# 因子 1: 颜色 (0-2)
+COLOR_FACTOR = {
+    0: {'name': 'Red',    'color': 'red'},
+    1: {'name': 'Green',  'color': 'green'},
+    2: {'name': 'Yellow', 'color': 'yellow'}
 }
 
-CLASS_ID_MAP = {
-    'red glia': 0, 'green glia': 1, 'yellow glia': 2,
-    'red neuron': 3, 'green neuron': 4, 'yellow neuron': 5,
-    'type_q': 6, 'type_w': 7, 'type_e': 8,
-    'other': 99 
+# 因子 2: 细胞类型 (基数)
+# ID = Type_Base + Color_Index
+TYPE_FACTOR = {
+    'Glia':   {'base': 0,  'name': 'Glia'},
+    'Neuron': {'base': 3,  'name': 'Neuron'},
+    'TypeA':  {'base': 6,  'name': 'Type A'},
+    'TypeB':  {'base': 9,  'name': 'Type B'},
+    'TypeC':  {'base': 12, 'name': 'Type C'}
 }
+
+# 自动生成所有 YOLO ID 的映射 (用于显示)
+CLASS_ID_MAP = {}
+for t_key, t_val in TYPE_FACTOR.items():
+    for c_key, c_val in COLOR_FACTOR.items():
+        cid = t_val['base'] + c_key
+        name = f"{c_val['name']} {t_val['name']}"
+        CLASS_ID_MAP[cid] = {'name': name, 'color': c_val['color'], 'type': t_key, 'color_idx': c_key}
+
+# 颜色映射 (用于 Napari)
+NAPARI_COLOR_MAP = {cid: info['color'] for cid, info in CLASS_ID_MAP.items()}

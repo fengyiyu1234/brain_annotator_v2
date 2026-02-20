@@ -4,53 +4,55 @@ from .config import TILE_SHAPE_PX
 
 class CoordinateSystem:
     def __init__(self, xml_path):
-        self.tile_offsets = {} # filename_prefix -> (x, y)
-        self.tiles = self._parse_xml(xml_path)
+        self.tiles = [] 
+        self.XY_RESIZING = 1.0 
+        self.z_max = 0  # 新增：保存全局最大的 Z 起跳点 (用于削平山头)
+        self._parse_xml(xml_path)
         
     def _parse_xml(self, path):
         if not os.path.exists(path):
-            return []
+            print(f"[Error] XML not found: {path}")
+            return
 
-        tree = ET.parse(path)
-        root = tree.getroot()
-        tiles = []
-        
-        for i, stack in enumerate(root.findall(".//Stack")):
-            # 你确认 XML 中的 ABS_H/V 是像素单位
-            # 如果 XML 里的值已经是像 10404 这样的大整数，直接取 int
-            abs_x = int(float(stack.get('ABS_H')))
-            abs_y = int(float(stack.get('ABS_V')))
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+            stacks = root.findall(".//Stack")
             
-            dir_name = stack.get('DIR_NAME') # e.g. "346900/346900_306100"
-            
-            # Key 用于匹配文件名: 346900_306100
-            key = dir_name.replace("\\", "/").split("/")[-1]
-            
-            self.tile_offsets[key] = (abs_x, abs_y)
+            if not stacks: return
 
-            tiles.append({
-                'id': i,
-                'dir': dir_name,
-                'abs_x': abs_x,
-                'abs_y': abs_y,
-                'w': TILE_SHAPE_PX[1],
-                'h': TILE_SHAPE_PX[0]
-            })
+            # 寻找 XY 极小值用于平移原点
+            min_x = min(float(s.get('ABS_H')) for s in stacks)
+            min_y = min(float(s.get('ABS_V')) for s in stacks)
             
-        print(f"[CoordSys] Loaded {len(tiles)} tiles.")
-        return tiles
-
-    def get_tile_info(self, filename):
-        # 从文件名提取 prefix: "346900_306100_277600.tiff" -> "346900_306100"
-        parts = filename.split('_')
-        if len(parts) >= 2:
-            key = f"{parts[0]}_{parts[1]}"
-            if key in self.tile_offsets:
-                # 返回该 Tile 的全局起始坐标
-                ox, oy = self.tile_offsets[key]
-                # 还需要返回 dir 路径部分用于拼接路径
-                # 简单遍历一下找到 dir (或者优化数据结构)
-                for t in self.tiles:
-                    if t['dir'].endswith(key):
-                        return t
-        return None
+            # 寻找最大的 ABS_D 作为 Z 轴的齐平基准！
+            self.z_max = max(int(float(s.get('ABS_D', 0.0))) for s in stacks)
+            
+            count = 0
+            for i, stack in enumerate(stacks):
+                raw_abs_h = float(stack.get('ABS_H'))
+                raw_abs_v = float(stack.get('ABS_V'))
+                raw_abs_z = int(float(stack.get('ABS_D', 0.0)))
+                
+                # 减去极小值，绝对不除以 10
+                abs_x = int((raw_abs_h - min_x) * self.XY_RESIZING)
+                abs_y = int((raw_abs_v - min_y) * self.XY_RESIZING)
+                
+                dir_name = stack.get('DIR_NAME', '')
+                norm_dir = dir_name.replace("\\", "/") 
+                
+                self.tiles.append({
+                    'id': i,
+                    'dir': norm_dir,
+                    'abs_x': abs_x,
+                    'abs_y': abs_y,
+                    'abs_z': raw_abs_z,  # 记录原始 Z 偏移量
+                    'w': TILE_SHAPE_PX[1], 
+                    'h': TILE_SHAPE_PX[0]  
+                })
+                count += 1
+                
+            print(f"[CoordinateSystem] Loaded {count} tiles. Z_MAX baseline = {self.z_max}")
+            
+        except Exception as e:
+            print(f"[Error] Failed to parse XML: {e}")
