@@ -12,11 +12,11 @@ from functools import partial
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QSplitter, QProgressDialog, 
-                             QApplication, QGroupBox, QShortcut)
+                             QApplication, QGroupBox, QShortcut, QSlider)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP
+from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP,TILE_SHAPE_PX
 from .utils import normalize_percentile
 from .widgets import OntologyTreeWidget
 
@@ -36,7 +36,6 @@ def parse_class_string(raw_cls):
     except: return 0 
 
 def natural_sort_key(s):
-    """解决 10.tif 排在 2.tif 前面的问题"""
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 # =========================================================
@@ -80,7 +79,7 @@ class RegistrationLoaderThread(QThread):
         self.finished_signal.emit(anchor_map)
 
 # =========================================================
-# Thread 2: Patch Loader (完全更新的切图坐标逻辑)
+# Thread 2: Patch Loader (3D Stack: Z-1, Z, Z+1)
 # =========================================================
 class PatchLoaderThread(QThread):
     progress_signal = pyqtSignal(int)
@@ -90,7 +89,7 @@ class PatchLoaderThread(QThread):
         super().__init__()
         self.anchors = anchors 
         self.tiles = coord_sys.tiles
-        self.z_max = coord_sys.z_max  # 获取全脑的齐平起跳点
+        self.z_max = coord_sys.z_max
         self.root_red = root_red
         self.root_green = root_green
         self.det_dir = det_dir
@@ -106,17 +105,13 @@ class PatchLoaderThread(QThread):
                     target_tile = t
                     break
             
-            if not target_tile: 
-                print(f"[Warning] Global XY ({gx}, {gy}) out of bounds. Skipped.")
-                continue
+            if not target_tile: continue
             
-            # 【核心 Z 轴换算】
             gz_0based = gz - 1
             z0 = self.z_max - target_tile['abs_z']
             local_z = gz_0based + z0
             
-            if local_z < 0:
-                continue
+            if local_z < 0: continue
             
             lx = gx - target_tile['abs_x']
             ly = gy - target_tile['abs_y']
@@ -124,62 +119,63 @@ class PatchLoaderThread(QThread):
             
             if key not in tasks_by_tile_z:
                 tasks_by_tile_z[key] = {'tile': target_tile, 'pts': []}
-            # 记录下 global_z，方便保存文件时追溯
             tasks_by_tile_z[key]['pts'].append({'lx': lx, 'ly': ly, 'gx': gx, 'gy': gy, 'gz': gz})
             
         total_tasks = len(tasks_by_tile_z)
-        
         patches = []
         det_cache = {} 
         processed = 0
         
-        for (t_dir, local_z), data in tasks_by_tile_z.items():
+        for (t_dir, center_lz), data in tasks_by_tile_z.items():
             tile = data['tile']
             t_prefix = t_dir.replace('\\', '/').split('/')[-1] 
             
-            # 读取 Detection CSV 缓存
+            # Load CSV cache
             if t_prefix not in det_cache:
                 det_path = None
                 for f in os.listdir(self.det_dir):
                     if t_prefix in f and f.endswith('.csv'):
                         det_path = os.path.join(self.det_dir, f)
                         if "_result" in f: break 
-                
                 if det_path:
                     try:
                         df = pd.read_csv(det_path, header=None,
                                          names=['fname', 'x1', 'y1', 'x2', 'y2', 'cls', 'conf', 'intensity', 'z'])
                         det_cache[t_prefix] = df
                     except: det_cache[t_prefix] = pd.DataFrame()
-                else:
-                    det_cache[t_prefix] = pd.DataFrame()
+                else: det_cache[t_prefix] = pd.DataFrame()
 
             df_tile = det_cache[t_prefix]
             
-            # 【核心修复】原始 YOLO 结果 CSV 里的 Z 是 1-based (等于 local_z + 1)
-            raw_csv_z = local_z + 1
-            df_z = df_tile[df_tile['z'] == raw_csv_z].copy() if not df_tile.empty else pd.DataFrame()
-            
             r_dir = os.path.join(self.root_red, t_dir)
             g_dir = os.path.join(self.root_green, t_dir)
+            fr = sorted(os.listdir(r_dir), key=natural_sort_key) if os.path.exists(r_dir) else []
+            fg = sorted(os.listdir(g_dir), key=natural_sort_key) if os.path.exists(g_dir) else []
             
-            try:
-                # 使用自然排序提取文件
-                fr = sorted(os.listdir(r_dir), key=natural_sort_key) if os.path.exists(r_dir) else []
-                fg = sorted(os.listdir(g_dir), key=natural_sort_key) if os.path.exists(g_dir) else []
+            # Read 3 Layers (Z-1, Z, Z+1)
+            rgb_full_stack = []
+            raw_files = []
+            dfs = []
+            
+            z_indices = [center_lz - 1, center_lz, center_lz + 1]
+            for z_idx, lz in enumerate(z_indices):
+                # 1. Image
+                if 0 <= lz < len(fr):
+                    ir = tifffile.imread(os.path.join(r_dir, fr[lz]))
+                    ig = tifffile.imread(os.path.join(g_dir, fg[lz])) if lz < len(fg) else np.zeros_like(ir)
+                    r8 = normalize_percentile(ir)
+                    g8 = normalize_percentile(ig)
+                    rgb_full_stack.append(np.dstack((r8, g8, np.zeros_like(r8))))
+                    raw_files.append(fr[lz])
+                else:
+                    rgb_full_stack.append(None)
+                    raw_files.append("OUT_OF_BOUNDS")
                 
-                if local_z < 0 or local_z >= len(fr): raise IndexError
-                
-                img_r = tifffile.imread(os.path.join(r_dir, fr[local_z]))
-                img_g = tifffile.imread(os.path.join(g_dir, fg[local_z])) if local_z < len(fg) else np.zeros_like(img_r)
-                
-                r8 = normalize_percentile(img_r)
-                g8 = normalize_percentile(img_g)
-                rgb = np.dstack((r8, g8, np.zeros_like(r8)))
-            except Exception as e:
-                processed += 1
-                continue 
+                # 2. DataFrame (Raw CSV z is 1-based)
+                csv_z = lz + 1
+                dfs.append(df_tile[df_tile['z'] == csv_z].copy() if not df_tile.empty else pd.DataFrame())
 
+            # Crop for each anchor point
             for pt in data['pts']:
                 lx, ly = pt['lx'], pt['ly']
                 cx, cy = int(lx), int(ly)
@@ -188,35 +184,46 @@ class PatchLoaderThread(QThread):
                 x2, y2 = cx + half, cy + half
                 
                 pad_l = max(0, -x1); pad_t = max(0, -y1)
-                pad_r = max(0, x2 - rgb.shape[1]); pad_b = max(0, y2 - rgb.shape[0])
+                pad_r = max(0, x2 - TILE_SHAPE_PX[1]); pad_b = max(0, y2 - TILE_SHAPE_PX[0])
                 sx1 = max(0, x1); sy1 = max(0, y1)
-                sx2 = min(x2, rgb.shape[1]); sy2 = min(y2, rgb.shape[0])
+                sx2 = min(x2, TILE_SHAPE_PX[1]); sy2 = min(y2, TILE_SHAPE_PX[0])
                 
-                crop = rgb[sy1:sy2, sx1:sx2]
-                if any([pad_l, pad_t, pad_r, pad_b]):
-                    crop = cv2.copyMakeBorder(crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=0)
+                # Stack 3 crops
+                crop_stack = []
+                for rgb_f in rgb_full_stack:
+                    if rgb_f is None:
+                        crop_stack.append(np.zeros((PATCH_SIZE, PATCH_SIZE, 3), dtype=np.uint8))
+                    else:
+                        crop = rgb_f[sy1:sy2, sx1:sx2]
+                        if any([pad_l, pad_t, pad_r, pad_b]):
+                            crop = cv2.copyMakeBorder(crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=0)
+                        crop_stack.append(crop)
                 
+                # Stack to shape (3, PATCH_SIZE, PATCH_SIZE, 3)
+                img_3d = np.stack(crop_stack)
+                
+                # Gather boxes for all 3 layers
                 boxes = []
-                if not df_z.empty:
-                    df_z['cx'] = (df_z['x1'] + df_z['x2']) / 2
-                    df_z['cy'] = (df_z['y1'] + df_z['y2']) / 2
-                    mask = (df_z['cx'] >= x1) & (df_z['cx'] <= x2) & (df_z['cy'] >= y1) & (df_z['cy'] <= y2)
-                    for _, row in df_z[mask].iterrows():
-                        cls_id = parse_class_string(row['cls'])
-                        boxes.append({
-                            'cls': cls_id,
-                            'x1': row['x1'] - x1, 'y1': row['y1'] - y1,
-                            'x2': row['x2'] - x1, 'y2': row['y2'] - y1
-                        })
+                for z_i, df_z in enumerate(dfs):
+                    if not df_z.empty:
+                        df_z['cx'] = (df_z['x1'] + df_z['x2']) / 2
+                        df_z['cy'] = (df_z['y1'] + df_z['y2']) / 2
+                        mask = (df_z['cx'] >= x1) & (df_z['cx'] <= x2) & (df_z['cy'] >= y1) & (df_z['cy'] <= y2)
+                        for _, row in df_z[mask].iterrows():
+                            boxes.append({
+                                'z_idx': z_i,  # 0, 1, or 2 (Z-1, Z, Z+1)
+                                'cls': parse_class_string(row['cls']),
+                                'conf': float(row.get('conf', 1.0)),
+                                'raw_file': raw_files[z_i],
+                                'x1': row['x1'] - x1, 'y1': row['y1'] - y1,
+                                'x2': row['x2'] - x1, 'y2': row['y2'] - y1
+                            })
                 
-                # 命名带上 local_z，方便你核对和保存
                 patches.append({
-                    'name': f"{t_prefix}_GZ{int(pt['gz'])}_LZ{local_z}_GX{int(pt['gx'])}_GY{int(pt['gy'])}",
-                    'image': crop,
+                    'name': f"{t_prefix}_GZ{int(pt['gz'])}_LZ{center_lz}_GX{int(pt['gx'])}_GY{int(pt['gy'])}",
+                    'image_stack': img_3d,
                     'boxes': boxes,
-                    'tile_prefix': t_prefix,
-                    'z': local_z,
-                    'gx': pt['gx'], 'gy': pt['gy']
+                    'center_z': center_lz
                 })
                 
             processed += 1
@@ -244,14 +251,22 @@ class SimpleAnnotator(QWidget):
         self.current_idx = 0
         self.undo_stack = [] 
         
+        self.region_cache = {} 
+        self.current_region_name = ""
         self.init_ui()
         QTimer.singleShot(100, self.start_indexing)
+        
+        # 实时刷新选中框信息的定时器 (100ms)
+        self.sel_timer = QTimer(self)
+        self.sel_timer.timeout.connect(self.update_info_panel)
+        self.sel_timer.start(100)
 
     def init_ui(self):
-        self.setWindowTitle("Brain Annotator - Anchor Cropping Mode")
-        self.resize(1600, 900)
+        self.setWindowTitle("Brain Annotator - 3D Anchor Cropping Mode")
+        self.resize(1600, 950)
         main_layout = QHBoxLayout(self)
         
+        # --- Left Panel ---
         left_panel = QWidget()
         l_lay = QVBoxLayout(left_panel)
         self.lbl_status = QLabel("Initializing Registration Anchors...")
@@ -265,39 +280,111 @@ class SimpleAnnotator(QWidget):
         self.tree_widget.tree.itemClicked.connect(self.on_tree_click)
         l_lay.addWidget(self.tree_widget)
         
+        # --- Middle Panel (Viewer & Sliders) ---
         mid_panel = QWidget()
         m_lay = QVBoxLayout(mid_panel)
         self.viewer = ViewerModel()
         self.qt_viewer = QtViewer(self.viewer)
+        # 强制显示 2D 切面，Napari 遇到 3D 数据会自动把维度 0（Z轴）变成滑块
         self.viewer.dims.ndisplay = 2
         m_lay.addWidget(self.qt_viewer)
         
+        # Z 轴层级滑块 (Z-1, Z, Z+1)
+        z_lay = QHBoxLayout()
+        z_lay.addWidget(QLabel("<b>Z-Slice (Z-1 / Z / Z+1):</b>"))
+        self.slider_z = QSlider(Qt.Horizontal)
+        self.slider_z.setRange(0, 2)
+        self.slider_z.setTickPosition(QSlider.TicksBelow)
+        self.slider_z.setTickInterval(1)
+        self.slider_z.valueChanged.connect(self.on_z_slider_changed)
+        z_lay.addWidget(self.slider_z)
+        m_lay.addLayout(z_lay)
+        
+        # 同步 Napari 自带的维度变化
+        self.viewer.dims.events.current_step.connect(self.sync_z_slider_from_napari)
+
+        # Patch 跳转滑块与按钮
         bot_bar = QHBoxLayout()
-        self.btn_prev = QPushButton("<< Prev (A)"); self.btn_prev.clicked.connect(lambda: self.change_patch(-1))
-        self.btn_next = QPushButton("Next (D) >>"); self.btn_next.clicked.connect(lambda: self.change_patch(1))
-        self.btn_save = QPushButton("Save Patch (S)"); self.btn_save.clicked.connect(self.save_current_patch)
+        bot_style = "font-size: 15px; font-weight: bold; padding: 5px;"
+
+        self.btn_prev = QPushButton("<< Prev (A)")
+        self.btn_prev.setStyleSheet(bot_style)
+        self.btn_prev.clicked.connect(lambda: self.change_patch(-1))
+        
+        self.slider_patch = QSlider(Qt.Horizontal)
+        self.slider_patch.valueChanged.connect(self.jump_to_patch)
+        
         self.lbl_counter = QLabel("0 / 0")
-        bot_bar.addWidget(self.btn_prev); bot_bar.addWidget(self.lbl_counter)
-        bot_bar.addWidget(self.btn_next); bot_bar.addWidget(self.btn_save)
+        self.lbl_counter.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.lbl_counter.setAlignment(Qt.AlignCenter)
+
+        self.btn_next = QPushButton("Next (D) >>")
+        self.btn_next.setStyleSheet(bot_style)
+        self.btn_next.clicked.connect(lambda: self.change_patch(1))
+
+        self.btn_save = QPushButton("Save Patch (S)")
+        self.btn_save.setStyleSheet(bot_style)
+        self.btn_save.clicked.connect(self.save_current_patch)
+        
+        bot_bar.addWidget(self.btn_prev)
+        bot_bar.addWidget(self.slider_patch)
+        bot_bar.addWidget(self.lbl_counter)
+        bot_bar.addWidget(self.btn_next)
+        bot_bar.addWidget(self.btn_save)
         m_lay.addLayout(bot_bar)
         
+        # --- Right Panel ---
         right_panel = QWidget()
-        right_panel.setFixedWidth(320)
+        right_panel.setFixedWidth(380)
+
+        right_panel.setStyleSheet("""
+            QLabel { font-size: 15px; }
+            QGroupBox { font-size: 15px; font-weight: bold; margin-top: 10px; }
+            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top center; padding: 0 5px; }
+        """)
+
         r_lay = QVBoxLayout(right_panel)
         
-        short_grp = QGroupBox("Modify Class (Shortcuts)")
+        info_grp = QGroupBox("Selected Cell Info")
+        i_lay = QVBoxLayout()
+        self.lbl_info_file = QLabel("Raw File: --")
+        self.lbl_info_class = QLabel("Class: --")
+        self.lbl_info_color = QLabel("Color: --")
+        self.lbl_info_conf = QLabel("Conf: --")
+        
+        # 加粗显示更清晰
+        self.lbl_info_file.setWordWrap(True)
+        self.lbl_info_class.setStyleSheet("font-weight: bold;")
+        self.lbl_info_color.setStyleSheet("font-weight: bold;")
+        
+        i_lay.addWidget(self.lbl_info_file)
+        i_lay.addWidget(self.lbl_info_class)
+        i_lay.addWidget(self.lbl_info_color)
+        i_lay.addWidget(self.lbl_info_conf)
+        info_grp.setLayout(i_lay)
+        r_lay.addWidget(info_grp)
+        
+        # 快捷键说明
+        short_grp = QGroupBox("Shortcuts")
         s_lay = QVBoxLayout()
+
+        self.lbl_current_mode = QLabel("<b>Current Mode:</b> <span style='color:green;'>Pan / Zoom (Drag)</span>")
+        s_lay.addWidget(self.lbl_current_mode)
         color_txt = ", ".join([f"{i+1}={v['name']}" for i, v in enumerate(COLOR_FACTOR.values())])
         type_txt = "<br>".join([f"<b>{TYPE_SHORTCUTS[i]}</b>: {k}" for i, k in enumerate(TYPE_FACTOR.keys())])
-        s_text = f"<b>Color:</b> {color_txt}<hr><b>Type:</b><br>{type_txt}"
-        s_lay.addWidget(QLabel(s_text))
+        mode_txt = "<b>V</b>: Toggle Select / Pan Mode"
+        s_text = f"<b>Tools:</b><br>{mode_txt}<hr><b>Color:</b><br>{color_txt}<hr><b>Type:</b><br>{type_txt}"
+        
+        lbl_shortcuts = QLabel(s_text)
+        lbl_shortcuts.setWordWrap(True)
+        s_lay.addWidget(lbl_shortcuts)
         short_grp.setLayout(s_lay)
         r_lay.addWidget(short_grp)
         r_lay.addStretch()
-        
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel); splitter.addWidget(mid_panel); splitter.addWidget(right_panel)
-        splitter.setSizes([250, 1050, 320])
+        splitter.setSizes([250, 1050, 380])
         main_layout.addWidget(splitter)
         
         self.bind_keys()
@@ -320,6 +407,21 @@ class SimpleAnnotator(QWidget):
         for i, (k, v) in enumerate(COLOR_FACTOR.items()):
             if i < len(COLOR_SHORTCUTS):
                 QShortcut(QKeySequence(COLOR_SHORTCUTS[i]), self).activated.connect(partial(self.modify_selection, 'color', i))
+        QShortcut(QKeySequence("V"), self).activated.connect(self.toggle_tool_mode)
+
+    def toggle_tool_mode(self):
+        """单键切换：在 选中 (select) 和 拖拽 (pan_zoom) 之间来回切换，并更新 UI"""
+        if hasattr(self, 'shapes_layer'):
+            current_mode = self.shapes_layer.mode
+            
+            if current_mode == 'select':
+                # 切回拖拽模式
+                self.shapes_layer.mode = 'pan_zoom'
+                self.lbl_current_mode.setText("<b>Current Mode:</b> <span style='color:green;'>Pan / Zoom (Drag)</span>")
+            else:
+                # 切换到选中模式
+                self.shapes_layer.mode = 'select'
+                self.lbl_current_mode.setText("<b>Current Mode:</b> <span style='color:blue;'>Select Box (Click)</span>")
 
     def start_indexing(self):
         self.progress.setLabelText("Loading Registration Anchors...")
@@ -333,41 +435,67 @@ class SimpleAnnotator(QWidget):
         self.progress.close()
         self.anchor_map = anchor_map
         total = sum(len(v) for v in anchor_map.values())
-        self.lbl_status.setText(f"Loaded {total} Anchors in Space.")
+        self.lbl_status.setText(f"Loaded {total} Anchors.")
 
     def on_tree_click(self, item, col):
         nid = item.data(0, Qt.UserRole)
         region_name = item.text(0)
-        print(f"\n{'='*50}\n[UI ACTION] Selected Brain Region: {region_name}")
+        self.current_region_name = region_name
         
+        print(f"\n{'='*50}")
+        print(f"[DEBUG] Clicked Region: '{region_name}'")
+        print(f"[DEBUG] Current Cache Keys: {list(self.region_cache.keys())}")
+        
+        # ------------------ 读取缓存逻辑 ------------------
+        if region_name in self.region_cache:
+            print(f"[DEBUG] 🟢 CACHE HIT! Loading '{region_name}' instantly from memory.")
+            self.lbl_status.setText(f"Loaded '{region_name}' from Memory Cache.")
+            # 使用内存中的数据，秒开！
+            self.patches_loaded(self.region_cache[region_name])
+            return  # <--- 极其关键！找到了就直接退出函数，绝对不再往下执行裁剪！
+        # --------------------------------------------------
+
+        print(f"[DEBUG] 🔴 CACHE MISS! Preparing to crop patches for '{region_name}'...")
         desc_ids = self.ontology.get_all_descendant_ids(nid)
         target_gos = [self.ontology.id_to_go[i] for i in desc_ids if i in self.ontology.id_to_go]
         
         anchors = []
         for go in target_gos:
-            if go in self.anchor_map:
-                anchors.extend(self.anchor_map[go])
+            if go in self.anchor_map: anchors.extend(self.anchor_map[go])
                 
         if not anchors:
-            print(f"[CHECKPOINT] No cells found in Registration data for {region_name}.")
             self.lbl_status.setText(f"No cells found for {region_name}.")
             return
             
-        print(f"[CHECKPOINT] Extracted {len(anchors)} Registration Anchors (Cells) for {region_name}.")
         self.lbl_status.setText(f"Cropping {len(anchors)} patches...")
         self.progress.setLabelText("Cropping Tiles...")
+        self.progress.setValue(0)
         self.progress.show()
         
-        # 【核心修正】把整个 coord_sys 传给线程，以便使用 z_max
         self.patch_loader = PatchLoaderThread(anchors, self.coord_sys, self.root_red, self.root_green, self.det_dir)
         self.patch_loader.progress_signal.connect(self.progress.setValue)
         self.patch_loader.finished_signal.connect(self.patches_loaded)
         self.patch_loader.start()
 
+
     def patches_loaded(self, patches):
         self.progress.close()
+        if not patches: return
+        
+        # ------------------ 写入缓存逻辑 ------------------
+        if self.current_region_name and self.current_region_name not in self.region_cache:
+            print(f"[DEBUG] 💾 SAVING '{self.current_region_name}' TO CACHE. Total patches: {len(patches)}")
+            self.region_cache[self.current_region_name] = patches
+        # --------------------------------------------------
+            
         self.current_patches = patches
         self.current_idx = 0
+        
+        self.slider_patch.blockSignals(True)
+        self.slider_patch.setRange(0, len(patches)-1)
+        self.slider_patch.setValue(0)
+        self.slider_patch.blockSignals(False)
+        
         self.undo_stack = []
         self.lbl_status.setText(f"Loaded {len(patches)} Patches.")
         self.show_patch()
@@ -375,30 +503,82 @@ class SimpleAnnotator(QWidget):
     def show_patch(self):
         if not self.current_patches: 
             self.viewer.layers.clear(); return
+            
         data = self.current_patches[self.current_idx]
         self.viewer.layers.clear()
-        self.viewer.add_image(data['image'], name='image')
         
-        shapes, classes, edges, labels = [], [], [], []
+        # 传入 3D 堆叠，Napari 会自动识别 (Z, Y, X, C)
+        self.viewer.add_image(data['image_stack'], rgb=True, name='stack')
+        
+        shapes, classes, edges = [], [], []
+        confs, raw_files = [], []
+        
         for b in data['boxes']:
-            cid = b['cls']
-            cfg = CLASS_ID_MAP.get(cid, {'name': f'UNK {cid}', 'color': 'white'})
-            shapes.append([[b['y1'], b['x1']], [b['y2'], b['x2']]])
-            classes.append(cid)
-            edges.append(NAPARI_COLOR_MAP.get(cid, 'white'))
-            labels.append(cfg['name'])
+            z = b['z_idx']
+            
+            shapes.append([
+                [z, b['y1'], b['x1']], # 左上
+                [z, b['y1'], b['x2']], # 右上
+                [z, b['y2'], b['x2']], # 右下
+                [z, b['y2'], b['x1']]  # 左下
+            ])
+            classes.append(b['cls'])
+            edges.append(NAPARI_COLOR_MAP.get(b['cls'], 'white'))
+            confs.append(b['conf'])
+            raw_files.append(b['raw_file'])
             
         if shapes:
+            # 移除了 text 参数，不再在画布上显示文字！只显示框。
             self.shapes_layer = self.viewer.add_shapes(
                 shapes, shape_type='rectangle', edge_width=2, edge_color=edges,
-                face_color='transparent', name='boxes',
-                text={'string': '{label}', 'color': 'white', 'anchor': 'upper_left', 'size': 8},
-                properties={'label': labels, 'class_id': classes}
+                face_color='transparent', name='boxes', ndim=3,
+                properties={'class_id': classes, 'conf': confs, 'raw_file': raw_files}
             )
             self.shapes_layer.events.data.connect(self.push_undo)
             
+        # 强制将视角跳到中间层 (Z=1, 即当前定位所在的层)
+        self.slider_z.setValue(1) 
+        
         self.lbl_counter.setText(f"{self.current_idx + 1} / {len(self.current_patches)}")
         self.viewer.text_overlay.text = data['name']
+        self.update_info_panel()
+
+    def on_z_slider_changed(self, value):
+        # 通过 GUI 底部滑块控制 Napari 内部的切片维度
+        if self.viewer.dims.ndim >= 3:
+            self.viewer.dims.set_current_step(0, value)
+
+    def sync_z_slider_from_napari(self, event):
+        # 假如用户在图像上用鼠标滚轮切换 Z，同步回到底部的滑块上
+        if self.viewer.dims.ndim >= 3:
+            step = self.viewer.dims.current_step[0]
+            self.slider_z.blockSignals(True)
+            self.slider_z.setValue(step)
+            self.slider_z.blockSignals(False)
+
+    def update_info_panel(self):
+        """定时器调用：实时读取当前选中的框，并更新右侧面板文字"""
+        if not hasattr(self, 'shapes_layer'): return
+        
+        selected = list(self.shapes_layer.selected_data)
+        if len(selected) == 1:
+            idx = selected[0]
+            props = self.shapes_layer.properties
+            c_id = int(props['class_id'][idx])
+            c_name = CLASS_ID_MAP.get(c_id, {}).get('name', 'Unknown')
+            c_color = CLASS_ID_MAP.get(c_id, {}).get('color', 'white')
+            conf = props['conf'][idx]
+            raw_f = props['raw_file'][idx]
+            
+            self.lbl_info_file.setText(f"Raw File: <span style='color:blue;'>{raw_f}</span>")
+            self.lbl_info_class.setText(f"Class: {c_name}")
+            self.lbl_info_color.setText(f"Color: {c_color.capitalize()}")
+            self.lbl_info_conf.setText(f"Conf: {conf:.3f}")
+        else:
+            self.lbl_info_file.setText(f"Raw File: --")
+            self.lbl_info_class.setText(f"Class: --")
+            self.lbl_info_color.setText(f"Color: --")
+            self.lbl_info_conf.setText(f"Conf: --")
 
     def modify_selection(self, factor, value):
         if not hasattr(self, 'shapes_layer'): return
@@ -419,17 +599,19 @@ class SimpleAnnotator(QWidget):
             if not cfg: continue
             
             props['class_id'][idx] = new_id
-            props['label'][idx] = cfg['name']
             
             from napari.utils.colormaps.standardize_color import transform_color
             edge_c[idx] = transform_color(cfg['color'])[0]
             
+            # Update background memory list
             self.current_patches[self.current_idx]['boxes'][idx]['cls'] = new_id
             
         self.shapes_layer.properties = props
         self.shapes_layer.edge_color = edge_c
         self.shapes_layer.refresh()
-        self.shapes_layer.refresh_text()
+        
+        # 强制刷新右侧信息面板
+        self.update_info_panel()
 
     def push_undo(self, event):
         if not self.current_patches: return
@@ -444,7 +626,13 @@ class SimpleAnnotator(QWidget):
 
     def change_patch(self, delta):
         if not self.current_patches: return
-        self.current_idx = (self.current_idx + delta) % len(self.current_patches)
+        new_idx = (self.current_idx + delta) % len(self.current_patches)
+        # 通过触发滑块改变来跳转，保证 UI 统一
+        self.slider_patch.setValue(new_idx)
+
+    def jump_to_patch(self, idx):
+        if not self.current_patches: return
+        self.current_idx = idx
         self.undo_stack = []
         self.show_patch()
 
@@ -458,12 +646,18 @@ class SimpleAnnotator(QWidget):
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(lbl_dir, exist_ok=True)
         
-        cv2.imwrite(os.path.join(img_dir, base+'.jpg'), cv2.cvtColor(data['image'], cv2.COLOR_RGB2BGR))
+        # 注意：因为我们提取了 3 层，这里仅保存中间目标层 (Index=1) 的图像和框，用作标注真值库
+        target_img = data['image_stack'][1]
+        cv2.imwrite(os.path.join(img_dir, base+'.jpg'), cv2.cvtColor(target_img, cv2.COLOR_RGB2BGR))
         
         lines = []
         if hasattr(self, 'shapes_layer'):
             for i, box in enumerate(self.shapes_layer.data):
-                ys, xs = box[:, 0], box[:, 1]
+                # box in 3D is [[z, y1, x1], [z, y2, x2]]
+                z_coord = int(box[0][0])
+                if z_coord != 1: continue # 只有中间目标层的框会被保存
+                
+                ys, xs = box[:, 1], box[:, 2] 
                 x1, x2 = min(xs), max(xs)
                 y1, y2 = min(ys), max(ys)
                 
@@ -478,4 +672,4 @@ class SimpleAnnotator(QWidget):
         with open(os.path.join(lbl_dir, base+'.txt'), 'w') as f:
             f.write("\n".join(lines))
             
-        self.viewer.text_overlay.text = f"Saved {base}!"
+        self.viewer.text_overlay.text = f"Saved Central Slice for {base}!"
