@@ -2,7 +2,7 @@
 import numpy as np
 
 # --- Parameters ---
-PATCH_SIZE = 256
+PATCH_SIZE = 128
 TILE_SHAPE_PX = (2048, 2048) 
 
 TYPE_SHORTCUTS = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U']

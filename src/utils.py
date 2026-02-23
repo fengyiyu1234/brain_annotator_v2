@@ -4,7 +4,7 @@ import numpy as np
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
-def normalize_percentile(data, p_low=0.5, p_high=99.5):
+def normalize_percentile(data, p_low=0, p_high=100):
     if data is None or data.size == 0: return data
     data_f = data.astype(np.float32)
     if data.ndim == 3:

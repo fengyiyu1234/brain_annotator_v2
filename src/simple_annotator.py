@@ -17,7 +17,7 @@ from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
 from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP,TILE_SHAPE_PX
-from .utils import normalize_percentile
+#from .utils import normalize_percentile
 from .widgets import OntologyTreeWidget
 
 TYPE_SHORTCUTS = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U']
@@ -163,9 +163,9 @@ class PatchLoaderThread(QThread):
                 if 0 <= lz < len(fr):
                     ir = tifffile.imread(os.path.join(r_dir, fr[lz]))
                     ig = tifffile.imread(os.path.join(g_dir, fg[lz])) if lz < len(fg) else np.zeros_like(ir)
-                    r8 = normalize_percentile(ir)
-                    g8 = normalize_percentile(ig)
-                    rgb_full_stack.append(np.dstack((r8, g8, np.zeros_like(r8))))
+                    #r8 = normalize_percentile(ir)
+                    #g8 = normalize_percentile(ig)
+                    rgb_full_stack.append(np.dstack((ir, ig, np.zeros_like(ir))))
                     raw_files.append(fr[lz])
                 else:
                     rgb_full_stack.append(None)
@@ -192,7 +192,7 @@ class PatchLoaderThread(QThread):
                 crop_stack = []
                 for rgb_f in rgb_full_stack:
                     if rgb_f is None:
-                        crop_stack.append(np.zeros((PATCH_SIZE, PATCH_SIZE, 3), dtype=np.uint8))
+                        crop_stack.append(np.zeros((PATCH_SIZE, PATCH_SIZE, 3), dtype=np.uint16))
                     else:
                         crop = rgb_f[sy1:sy2, sx1:sx2]
                         if any([pad_l, pad_t, pad_r, pad_b]):
@@ -345,12 +345,18 @@ class SimpleAnnotator(QWidget):
 
         r_lay = QVBoxLayout(right_panel)
         
+        # =========================================================
+        # 1. Selected Cell Info & Pixel Probe (选中细胞信息 & 像素探针)
+        # =========================================================
         info_grp = QGroupBox("Selected Cell Info")
         i_lay = QVBoxLayout()
         self.lbl_info_file = QLabel("Raw File: --")
         self.lbl_info_class = QLabel("Class: --")
         self.lbl_info_color = QLabel("Color: --")
         self.lbl_info_conf = QLabel("Conf: --")
+        
+        # 【新增】：用于显示探针点击的像素强度
+        self.lbl_pixel_val = QLabel("<b>Pixel Probe:</b> (Hold <b>Shift + Click</b> on image)")
         
         # 加粗显示更清晰
         self.lbl_info_file.setWordWrap(True)
@@ -361,35 +367,85 @@ class SimpleAnnotator(QWidget):
         i_lay.addWidget(self.lbl_info_class)
         i_lay.addWidget(self.lbl_info_color)
         i_lay.addWidget(self.lbl_info_conf)
+        i_lay.addWidget(self.lbl_pixel_val) # 加入探针面板
+        
         info_grp.setLayout(i_lay)
         r_lay.addWidget(info_grp)
         
-        # 快捷键说明
+        # =========================================================
+        # 2. Shortcuts (快捷键说明)
+        # =========================================================
         short_grp = QGroupBox("Shortcuts")
         s_lay = QVBoxLayout()
 
         self.lbl_current_mode = QLabel("<b>Current Mode:</b> <span style='color:green;'>Pan / Zoom (Drag)</span>")
         s_lay.addWidget(self.lbl_current_mode)
         color_txt = ", ".join([f"{i+1}={v['name']}" for i, v in enumerate(COLOR_FACTOR.values())])
-        type_txt = "<br>".join([f"<b>{TYPE_SHORTCUTS[i]}</b>: {k}" for i, k in enumerate(TYPE_FACTOR.keys())])
-        mode_txt = "<b>V</b>: Toggle Select / Pan Mode"
+        type_txt = "<br>".join([f"{TYPE_SHORTCUTS[i]}: {k}" for i, k in enumerate(TYPE_FACTOR.keys())])
+        mode_txt = "V: Toggle Select / Pan Mode"
         s_text = f"<b>Tools:</b><br>{mode_txt}<hr><b>Color:</b><br>{color_txt}<hr><b>Type:</b><br>{type_txt}"
         
         lbl_shortcuts = QLabel(s_text)
         lbl_shortcuts.setWordWrap(True)
         s_lay.addWidget(lbl_shortcuts)
+        
         short_grp.setLayout(s_lay)
         r_lay.addWidget(short_grp)
-        r_lay.addStretch()
+
+        # =========================================================
+        # 3. Image Adjustments (图像滑块调节)
+        # =========================================================
+        adj_grp = QGroupBox("Image Adjustments")
+        a_lay = QVBoxLayout()
+        
+        def make_slider(name, min_val, max_val, default_val, callback):
+            row = QHBoxLayout()
+            lbl = QLabel(name)
+            lbl.setFixedWidth(130) # 调宽一点以容纳 Min/Max 数值
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(min_val, max_val)
+            sl.setValue(default_val)
+            sl.valueChanged.connect(callback)
+            row.addWidget(lbl)
+            row.addWidget(sl)
+            return sl, lbl, row
+
+        # 获取滑块、标签和布局
+        self.sl_red_c, self.lbl_red_c, r1 = make_slider("R Cont", 100, 65535, 15000, self.update_image_display)
+        self.sl_red_l, self.lbl_red_l, r2 = make_slider("R Light", 10, 300, 100, self.update_image_display)
+        self.sl_grn_c, self.lbl_grn_c, r3 = make_slider("G Cont", 100, 65535, 15000, self.update_image_display)
+        self.sl_grn_l, self.lbl_grn_l, r4 = make_slider("G Light", 10, 300, 100, self.update_image_display)
+
+        a_lay.addLayout(r1); a_lay.addLayout(r2)
+        a_lay.addLayout(r3); a_lay.addLayout(r4)
+        
+        # 界面上提示通道开关快捷键
+        hint_lbl = QLabel("<span style='color:gray;'><small>Shortcut: Press <b>Z</b> (Toggle Red), <b>X</b> (Toggle Green)</small></span>")
+        a_lay.addWidget(hint_lbl)
+        
+        adj_grp.setLayout(a_lay)
+        r_lay.addWidget(adj_grp)
+
+        # =========================================================
+        # 4. 结尾收尾工作
+        # =========================================================
+        r_lay.addStretch() # 把所有框顶到上面
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel); splitter.addWidget(mid_panel); splitter.addWidget(right_panel)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(mid_panel)
+        splitter.addWidget(right_panel)
         splitter.setSizes([250, 1050, 380])
         main_layout.addWidget(splitter)
         
         self.bind_keys()
         self.shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
         self.shortcut_undo.activated.connect(self.undo_action)
+        
+        # 绑定 Z 和 X 键用于快速开关通道 (在这里一并加上)
+        QShortcut(QKeySequence('Z'), self).activated.connect(lambda: self.toggle_channel('Red'))
+        QShortcut(QKeySequence('X'), self).activated.connect(lambda: self.toggle_channel('Green'))
+
 
     def bind_keys(self):
         def next_cb(v): self.change_patch(1)
@@ -503,13 +559,69 @@ class SimpleAnnotator(QWidget):
     def show_patch(self):
         if not self.current_patches: 
             self.viewer.layers.clear(); return
-            
+        
+        for sl in [self.sl_red_c, self.sl_red_l, self.sl_grn_c, self.sl_grn_l]:
+            sl.blockSignals(True)
+
+        self.sl_red_c.setValue(65535)  # 默认 Contrast Max
+        self.sl_red_l.setValue(100)    # 默认 Lightness (Gamma 1.0)
+        self.sl_grn_c.setValue(65535)
+        self.sl_grn_l.setValue(100)
+
+        for sl in [self.sl_red_c, self.sl_red_l, self.sl_grn_c, self.sl_grn_l]:
+            sl.blockSignals(False)
+
         data = self.current_patches[self.current_idx]
         self.viewer.layers.clear()
         
-        # 传入 3D 堆叠，Napari 会自动识别 (Z, Y, X, C)
-        self.viewer.add_image(data['image_stack'], rgb=True, name='stack')
+        # ========================================================
+        # 【新增 1】：提取图像数组，并更新右侧滑块标题的 Min/Max
+        # ========================================================
+        img_stack = data['image_stack']
+        r_data = img_stack[..., 0]
+        g_data = img_stack[..., 1]
+        self.lbl_red_c.setText(
+            f"R Cont<br>"
+            f"<span style='color: gray; font-size: 12px;'>[{r_data.min()}~{r_data.max()}]")
+        self.lbl_grn_c.setText(
+            f"G Cont<br>"
+            f"[<span style='color: gray; font-size: 12px;'>{g_data.min()}~{g_data.max()}]")
         
+        # 传入 3D 堆叠，Napari 会自动识别 (Z, Y, X, C)
+        self.viewer.add_image(
+            img_stack, # <--- 注意这里用提取出来的变量名
+            channel_axis=3, 
+            name=['Red', 'Green', 'Blue'],
+            colormap=['red', 'green', 'blue'],
+            blending='additive' # 荧光叠加的关键
+        )
+
+        # ========================================================
+        # 【新增 2】：绑定探针事件，按住 Shift 点击图像即可读取强度
+        # ========================================================
+        @self.viewer.mouse_drag_callbacks.append
+        def probe_pixel(viewer, event):
+            if 'Shift' in event.modifiers:
+                # 获取鼠标点击的三维坐标 (z, y, x)
+                pos = event.position
+                z, y, x = int(pos[0]), int(pos[1]), int(pos[2])
+                
+                # 安全边界检查，防止点到图片外面报错
+                if 0 <= z < img_stack.shape[0] and 0 <= y < img_stack.shape[1] and 0 <= x < img_stack.shape[2]:
+                    val_r = img_stack[z, y, x, 0]
+                    val_g = img_stack[z, y, x, 1]
+                    # 更新右侧面板的文本
+                    self.lbl_pixel_val.setText(
+                        f"<b>Pixel Probe:<br>"
+                        f"Z:{z} Y:{y} X:{x}<br>"
+                        f"<span style='color:red;'>R: {val_r}</span><br>"
+                        f"<span style='color:green;'>G: {val_g}</span>"
+                    )
+            yield
+
+        # ========================================================
+        # 下面是你原有的绘制标注框的逻辑，保持不变
+        # ========================================================
         shapes, classes, edges = [], [], []
         confs, raw_files = [], []
         
@@ -528,7 +640,6 @@ class SimpleAnnotator(QWidget):
             raw_files.append(b['raw_file'])
             
         if shapes:
-            # 移除了 text 参数，不再在画布上显示文字！只显示框。
             self.shapes_layer = self.viewer.add_shapes(
                 shapes, shape_type='rectangle', edge_width=2, edge_color=edges,
                 face_color='transparent', name='boxes', ndim=3,
@@ -536,20 +647,63 @@ class SimpleAnnotator(QWidget):
             )
             self.shapes_layer.events.data.connect(self.push_undo)
             
-        # 强制将视角跳到中间层 (Z=1, 即当前定位所在的层)
+            self.shapes_layer.mode = 'select'
+            if hasattr(self, 'lbl_current_mode'):
+                self.lbl_current_mode.setText("<b>Current Mode:</b> <span style='color:blue;'>Select Box (Click)</span>")
+            
         self.slider_z.setValue(1) 
         
         self.lbl_counter.setText(f"{self.current_idx + 1} / {len(self.current_patches)}")
         self.viewer.text_overlay.text = data['name']
         self.update_info_panel()
 
+    def sync_canvas_to_memory(self):
+        """将 Napari 画布上最新的框状态（删除、拖拽修改后），反向覆盖回内存中"""
+        # 如果根本没有加载数据，直接跳过
+        if not hasattr(self, 'current_patches') or not self.current_patches:
+            return
+            
+        # 如果当前图层被清空了（比如你把框全删了）
+        if not hasattr(self, 'shapes_layer') or self.shapes_layer not in self.viewer.layers:
+            self.current_patches[self.current_idx]['boxes'] = []
+            return
+
+        new_boxes = []
+        props = self.shapes_layer.properties
+        
+        # 遍历画布上现存的所有框
+        for i, box in enumerate(self.shapes_layer.data):
+            # 提取 3D 坐标 (z, y, x)
+            z = int(box[0][0])
+            ys, xs = box[:, 1], box[:, 2]
+            
+            # 重新计算左上角和右下角（即使你用鼠标拖动了框，这里也会抓到最新坐标）
+            y1, y2 = float(min(ys)), float(max(ys))
+            x1, x2 = float(min(xs)), float(max(xs))
+            
+            # 从 properties 属性表中把分类、置信度等对应信息拿回来
+            cls_id = int(props['class_id'][i]) if 'class_id' in props else 0
+            conf = float(props['conf'][i]) if 'conf' in props else 1.0
+            raw_file = str(props['raw_file'][i]) if 'raw_file' in props else ""
+            
+            # 组装成你原始的代码需要的字典格式
+            new_boxes.append({
+                'z_idx': z,
+                'y1': y1, 'x1': x1,
+                'y2': y2, 'x2': x2,
+                'cls': cls_id,
+                'conf': conf,
+                'raw_file': raw_file
+            })
+            
+        # 霸道覆盖：用画面上的最新状态替换掉内存里的旧状态
+        self.current_patches[self.current_idx]['boxes'] = new_boxes
+
     def on_z_slider_changed(self, value):
-        # 通过 GUI 底部滑块控制 Napari 内部的切片维度
         if self.viewer.dims.ndim >= 3:
             self.viewer.dims.set_current_step(0, value)
 
     def sync_z_slider_from_napari(self, event):
-        # 假如用户在图像上用鼠标滚轮切换 Z，同步回到底部的滑块上
         if self.viewer.dims.ndim >= 3:
             step = self.viewer.dims.current_step[0]
             self.slider_z.blockSignals(True)
@@ -580,6 +734,31 @@ class SimpleAnnotator(QWidget):
             self.lbl_info_color.setText(f"Color: --")
             self.lbl_info_conf.setText(f"Conf: --")
 
+    def update_image_display(self):
+        """实时读取右侧滑块数值，并应用到 Napari 的对应通道层"""
+        if not hasattr(self, 'viewer'): return
+        
+        r_max = self.sl_red_c.value()
+        r_gamma = self.sl_red_l.value() / 100.0
+        g_max = self.sl_grn_c.value()
+        g_gamma = self.sl_grn_l.value() / 100.0
+
+        for layer in self.viewer.layers:
+            if type(layer).__name__ == 'Image':
+                if layer.name == 'Red':
+                    layer.contrast_limits = (0, r_max)
+                    layer.gamma = r_gamma
+                elif layer.name == 'Green':
+                    layer.contrast_limits = (0, g_max)
+                    layer.gamma = g_gamma
+
+    def toggle_channel(self, ch_name):
+        """按键切换对应通道的显示/隐藏"""
+        if not hasattr(self, 'viewer'): return
+        for layer in self.viewer.layers:
+            if layer.name == ch_name:
+                layer.visible = not layer.visible
+
     def modify_selection(self, factor, value):
         if not hasattr(self, 'shapes_layer'): return
         sel_idx = list(self.shapes_layer.selected_data)
@@ -603,14 +782,11 @@ class SimpleAnnotator(QWidget):
             from napari.utils.colormaps.standardize_color import transform_color
             edge_c[idx] = transform_color(cfg['color'])[0]
             
-            # Update background memory list
             self.current_patches[self.current_idx]['boxes'][idx]['cls'] = new_id
             
         self.shapes_layer.properties = props
         self.shapes_layer.edge_color = edge_c
         self.shapes_layer.refresh()
-        
-        # 强制刷新右侧信息面板
         self.update_info_panel()
 
     def push_undo(self, event):
@@ -621,23 +797,60 @@ class SimpleAnnotator(QWidget):
 
     def undo_action(self):
         if not self.undo_stack: return
-        self.current_patches[self.current_idx]['boxes'] = self.undo_stack.pop()
-        self.show_patch()
+        
+        restored_boxes = self.undo_stack.pop()
+        self.current_patches[self.current_idx]['boxes'] = restored_boxes
+        
+        if hasattr(self, 'shapes_layer') and self.shapes_layer in self.viewer.layers:
+            # 移除前先解绑信号，防止触发多余的 undo 记录
+            self.shapes_layer.events.data.disconnect(self.push_undo)
+            self.viewer.layers.remove(self.shapes_layer)
+            
+        shapes, classes, edges = [], [], []
+        confs, raw_files = [], []
+        
+        for b in restored_boxes:
+            z = b['z_idx']
+            shapes.append([
+                [z, b['y1'], b['x1']], # 左上
+                [z, b['y1'], b['x2']], # 右上
+                [z, b['y2'], b['x2']], # 右下
+                [z, b['y2'], b['x1']]  # 左下
+            ])
+            classes.append(b['cls'])
+            edges.append(NAPARI_COLOR_MAP.get(b['cls'], 'white'))
+            confs.append(b['conf'])
+            raw_files.append(b['raw_file'])
+            
+        if shapes:
+            self.shapes_layer = self.viewer.add_shapes(
+                shapes, shape_type='rectangle', edge_width=2, edge_color=edges,
+                face_color='transparent', name='boxes', ndim=3,
+                properties={'class_id': classes, 'conf': confs, 'raw_file': raw_files}
+            )
+            # 重新绑定监听，并保持在选中模式
+            self.shapes_layer.events.data.connect(self.push_undo)
+            self.shapes_layer.mode = 'select'
+            if hasattr(self, 'lbl_current_mode'):
+                self.lbl_current_mode.setText("<b>Current Mode:</b> <span style='color:blue;'>Select Box (Click)</span>")
 
     def change_patch(self, delta):
         if not self.current_patches: return
+        self.sync_canvas_to_memory()
         new_idx = (self.current_idx + delta) % len(self.current_patches)
         # 通过触发滑块改变来跳转，保证 UI 统一
         self.slider_patch.setValue(new_idx)
 
     def jump_to_patch(self, idx):
         if not self.current_patches: return
+        self.sync_canvas_to_memory()
         self.current_idx = idx
         self.undo_stack = []
         self.show_patch()
 
     def save_current_patch(self):
         if not self.current_patches: return
+        self.sync_canvas_to_memory()
         data = self.current_patches[self.current_idx]
         base = data['name']
         
