@@ -10,14 +10,14 @@ from napari.components import ViewerModel
 from napari.qt import QtViewer
 from functools import partial
 import time
+import random
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QSplitter, QProgressDialog, 
                              QApplication, QGroupBox, QShortcut, QSlider)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP,TILE_SHAPE_PX
-#from .utils import normalize_percentile
+from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP,TILE_SHAPE_PX,CELL_SAMPLE_RATIO
 from .widgets import OntologyTreeWidget
 
 TYPE_SHORTCUTS = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U']
@@ -529,9 +529,8 @@ class SimpleAnnotator(QWidget):
         if region_name in self.region_cache:
             print(f"[DEBUG] 🟢 CACHE HIT! Loading '{region_name}' instantly from memory.")
             self.lbl_status.setText(f"Loaded '{region_name}' from Memory Cache.")
-            # 使用内存中的数据，秒开！
             self.patches_loaded(self.region_cache[region_name])
-            return  # <--- 极其关键！找到了就直接退出函数，绝对不再往下执行裁剪！
+            return  
         # --------------------------------------------------
 
         print(f"[DEBUG] 🔴 CACHE MISS! Preparing to crop patches for '{region_name}'...")
@@ -545,6 +544,16 @@ class SimpleAnnotator(QWidget):
         if not anchors:
             self.lbl_status.setText(f"No cells found for {region_name}.")
             return
+        
+        # ========================================================
+        # 【核心新增】：锚点抽样逻辑 (10% Anchors, 100% 内部 Bounding Boxes)
+        # ========================================================
+        total_anchors = len(anchors)
+        if 0.0 < CELL_SAMPLE_RATIO < 1.0:
+            # 确保至少保留 1 个锚点
+            keep_count = max(1, int(total_anchors * CELL_SAMPLE_RATIO))
+            anchors = random.sample(anchors, keep_count)
+            print(f"[DEBUG] 🎯 触发随机抽样: 原始 {total_anchors} 个锚点 -> 随机保留 {keep_count} 个 ({CELL_SAMPLE_RATIO*100}%)")
             
         self.lbl_status.setText(f"Cropping {len(anchors)} patches...")
         self.progress.setLabelText("Cropping Tiles...")
