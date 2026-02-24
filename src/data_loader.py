@@ -3,14 +3,16 @@ import os
 import glob
 import pandas as pd
 import tifffile
+import cv2
 import numpy as np
 import concurrent.futures
 from PyQt5.QtCore import QThread, pyqtSignal
 from collections import OrderedDict
+import random
 
 # 引入配置和工具
-from .config import CACHE_LIMIT_GB
-from .utils import natural_sort_key, normalize_percentile
+from .config import PATCH_SIZE, TILE_SHAPE_PX, CELL_SAMPLE_RATIO
+from .utils import natural_sort_key, parse_class_string
 
 class TileCache:
     def __init__(self, max_gb):
@@ -38,6 +40,202 @@ class TileCache:
     
     def get_cached_keys(self):
         return set(self.cache.keys())
+
+class RegistrationLoaderThread(QThread):
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(dict) 
+    
+    def __init__(self, reg_dir):
+        super().__init__()
+        self.reg_dir = reg_dir
+        
+    def run(self):
+        anchor_map = {}
+        if not os.path.exists(self.reg_dir):
+            self.finished_signal.emit(anchor_map)
+            return
+            
+        csv_files = []
+        for root, dirs, files in os.walk(self.reg_dir):
+            for f in files:
+                if f.endswith('.csv'): csv_files.append(os.path.join(root, f))
+                
+        for i, path in enumerate(csv_files):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        parts = line.strip().split(',', 7)
+                        if len(parts) >= 7:
+                            gx = float(parts[0])
+                            gy = float(parts[1])
+                            gz = int(float(parts[2]))
+                            go = int(parts[6])
+                            if go not in anchor_map: anchor_map[go] = []
+                            anchor_map[go].append((gx, gy, gz))
+            except Exception as e:
+                pass
+            self.progress_signal.emit(int((i+1)/len(csv_files)*100))
+            
+        self.finished_signal.emit(anchor_map)
+
+class PatchLoaderThread(QThread):
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(list)
+    
+    def __init__(self, anchors, coord_sys, root_red, root_green, det_dir):
+        super().__init__()
+        self.anchors = anchors 
+        self.tiles = coord_sys.tiles
+        self.z_max = coord_sys.z_max
+        self.root_red = root_red
+        self.root_green = root_green
+        self.det_dir = det_dir
+        
+    def run(self):
+        total_anchors = len(self.anchors)
+        
+        # 只要 config 里的值在 0~1 之间，必定触发抽样！
+        if 0.0 < CELL_SAMPLE_RATIO < 1.0: 
+            keep_count = max(1, int(total_anchors * CELL_SAMPLE_RATIO))
+            self.anchors = random.sample(self.anchors, keep_count)
+            print(f"random sampling: original {total_anchors} anchors -> sampling {keep_count}  ({CELL_SAMPLE_RATIO*100}%)")
+
+        print(f"\n[CHECKPOINT] Allocating {len(self.anchors)} anchors to Tiles...")
+        tasks_by_tile_z = {}
+        for (gx, gy, gz) in self.anchors:
+            target_tile = None
+            for t in self.tiles:
+                if t['abs_x'] <= gx < t['abs_x'] + t['w'] and \
+                   t['abs_y'] <= gy < t['abs_y'] + t['h']:
+                    target_tile = t
+                    break
+            
+            if not target_tile: continue
+            
+            gz_0based = gz - 1
+            z0 = self.z_max - target_tile['abs_z']
+            local_z = gz_0based + z0
+            
+            if local_z < 0: continue
+            
+            lx = gx - target_tile['abs_x']
+            ly = gy - target_tile['abs_y']
+            key = (target_tile['dir'], local_z)
+            
+            if key not in tasks_by_tile_z:
+                tasks_by_tile_z[key] = {'tile': target_tile, 'pts': []}
+            tasks_by_tile_z[key]['pts'].append({'lx': lx, 'ly': ly, 'gx': gx, 'gy': gy, 'gz': gz})
+            
+        total_tasks = len(tasks_by_tile_z)
+        patches = []
+        det_cache = {} 
+        processed = 0
+        
+        for (t_dir, center_lz), data in tasks_by_tile_z.items():
+            tile = data['tile']
+            t_prefix = t_dir.replace('\\', '/').split('/')[-1] 
+            
+            # Load CSV cache
+            if t_prefix not in det_cache:
+                det_path = None
+                for f in os.listdir(self.det_dir):
+                    if t_prefix in f and f.endswith('.csv'):
+                        det_path = os.path.join(self.det_dir, f)
+                        if "_result" in f: break 
+                if det_path:
+                    try:
+                        df = pd.read_csv(det_path, header=None,
+                                         names=['fname', 'x1', 'y1', 'x2', 'y2', 'cls', 'conf', 'intensity', 'z'])
+                        det_cache[t_prefix] = df
+                    except: det_cache[t_prefix] = pd.DataFrame()
+                else: det_cache[t_prefix] = pd.DataFrame()
+
+            df_tile = det_cache[t_prefix]
+            
+            r_dir = os.path.join(self.root_red, t_dir)
+            g_dir = os.path.join(self.root_green, t_dir)
+            fr = sorted(os.listdir(r_dir), key=natural_sort_key) if os.path.exists(r_dir) else []
+            fg = sorted(os.listdir(g_dir), key=natural_sort_key) if os.path.exists(g_dir) else []
+            
+            # Read 3 Layers (Z-1, Z, Z+1)
+            rgb_full_stack = []
+            raw_files = []
+            dfs = []
+            
+            z_indices = [center_lz - 1, center_lz, center_lz + 1]
+            for z_idx, lz in enumerate(z_indices):
+                # 1. Image
+                if 0 <= lz < len(fr):
+                    ir = tifffile.imread(os.path.join(r_dir, fr[lz]))
+                    ig = tifffile.imread(os.path.join(g_dir, fg[lz])) if lz < len(fg) else np.zeros_like(ir)
+                    #r8 = normalize_percentile(ir)
+                    #g8 = normalize_percentile(ig)
+                    rgb_full_stack.append(np.dstack((ir, ig, np.zeros_like(ir))))
+                    raw_files.append(fr[lz])
+                else:
+                    rgb_full_stack.append(None)
+                    raw_files.append("OUT_OF_BOUNDS")
+                
+                # 2. DataFrame (Raw CSV z is 1-based)
+                csv_z = lz + 1
+                dfs.append(df_tile[df_tile['z'] == csv_z].copy() if not df_tile.empty else pd.DataFrame())
+
+            # Crop for each anchor point
+            for pt in data['pts']:
+                lx, ly = pt['lx'], pt['ly']
+                cx, cy = int(lx), int(ly)
+                half = PATCH_SIZE // 2
+                x1, y1 = cx - half, cy - half
+                x2, y2 = cx + half, cy + half
+                
+                pad_l = max(0, -x1); pad_t = max(0, -y1)
+                pad_r = max(0, x2 - TILE_SHAPE_PX[1]); pad_b = max(0, y2 - TILE_SHAPE_PX[0])
+                sx1 = max(0, x1); sy1 = max(0, y1)
+                sx2 = min(x2, TILE_SHAPE_PX[1]); sy2 = min(y2, TILE_SHAPE_PX[0])
+                
+                # Stack 3 crops
+                crop_stack = []
+                for rgb_f in rgb_full_stack:
+                    if rgb_f is None:
+                        crop_stack.append(np.zeros((PATCH_SIZE, PATCH_SIZE, 3), dtype=np.uint16))
+                    else:
+                        crop = rgb_f[sy1:sy2, sx1:sx2]
+                        if any([pad_l, pad_t, pad_r, pad_b]):
+                            crop = cv2.copyMakeBorder(crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=0)
+                        crop_stack.append(crop)
+                
+                # Stack to shape (3, PATCH_SIZE, PATCH_SIZE, 3)
+                img_3d = np.stack(crop_stack)
+                
+                # Gather boxes for all 3 layers
+                boxes = []
+                for z_i, df_z in enumerate(dfs):
+                    if not df_z.empty:
+                        df_z['cx'] = (df_z['x1'] + df_z['x2']) / 2
+                        df_z['cy'] = (df_z['y1'] + df_z['y2']) / 2
+                        mask = (df_z['cx'] >= x1) & (df_z['cx'] <= x2) & (df_z['cy'] >= y1) & (df_z['cy'] <= y2)
+                        for _, row in df_z[mask].iterrows():
+                            boxes.append({
+                                'z_idx': z_i,  # 0, 1, or 2 (Z-1, Z, Z+1)
+                                'cls': parse_class_string(row['cls']),
+                                'conf': float(row.get('conf', 1.0)),
+                                'raw_file': raw_files[z_i],
+                                'x1': row['x1'] - x1, 'y1': row['y1'] - y1,
+                                'x2': row['x2'] - x1, 'y2': row['y2'] - y1
+                            })
+                
+                patches.append({
+                    'name': f"{t_prefix}_GZ{int(pt['gz'])}_LZ{center_lz}_GX{int(pt['gx'])}_GY{int(pt['gy'])}",
+                    'image_stack': img_3d,
+                    'boxes': boxes,
+                    'center_z': center_lz
+                })
+                
+            processed += 1
+            self.progress_signal.emit(int(processed/total_tasks*100))
+            
+        print(f"[CHECKPOINT] Patch Generation Complete. Yielded {len(patches)} image patches.")
+        self.finished_signal.emit(patches)
 
 # --- 数据加载线程 ---
 class DataLoaderThread(QThread):
@@ -95,10 +293,6 @@ class DataLoaderThread(QThread):
             
             stack_r = self.read_stack_parallel(files_r, "Red")
             stack_g = self.read_stack_parallel(files_g, "Green") if files_g else np.zeros_like(stack_r)
-            
-            self.progress_update.emit(90, "Normalizing Images...")
-            stack_r = normalize_percentile(stack_r)
-            stack_g = normalize_percentile(stack_g)
             
             self.progress_update.emit(95, "Parsing Detections...")
             detections = {}
