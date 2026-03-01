@@ -17,17 +17,14 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP, TILE_SHAPE_PX, TYPE_SHORTCUTS, COLOR_SHORTCUTS
+from .config import PATCH_SIZE, COLOR_FACTOR, TYPE_FACTOR, CLASS_ID_MAP, NAPARI_COLOR_MAP, TILE_SHAPE_PX, TYPE_SHORTCUTS, COLOR_SHORTCUTS, PRELOAD_GLOBAL_DATA
 # 引入工具函数
 from .utils import export_yolo_patch 
 # 引入我们刚刚剥离的线程类
-from .data_loader import RegistrationLoaderThread, PatchLoaderThread 
+from .data_loader import RegistrationLoaderThread, PatchLoaderThread, GlobalPreloadThread
 from .widgets import OntologyTreeWidget
 
-
-# =========================================================
 # Main GUI
-# =========================================================
 class SimpleAnnotator(QWidget):
     def __init__(self, coord_sys, ontology, det_dir, reg_dir, save_root, root_red, root_green):
         super().__init__()
@@ -43,6 +40,7 @@ class SimpleAnnotator(QWidget):
         self.current_patches = []
         self.current_idx = 0
         self.undo_stack = [] 
+        self.global_image_cache = {}
         
         self.region_cache = {} 
         self.current_region_name = ""
@@ -302,12 +300,48 @@ class SimpleAnnotator(QWidget):
         self.loader.progress_signal.connect(self.progress.setValue)
         self.loader.finished_signal.connect(self.indexing_done)
         self.loader.start()
+        self.start_global_preload()
 
     def indexing_done(self, anchor_map):
         self.progress.close()
         self.anchor_map = anchor_map
         total = sum(len(v) for v in anchor_map.values())
         self.lbl_status.setText(f"Loaded {total} Anchors.")
+        self.start_global_preload()
+
+    def start_global_preload(self):
+        """如果开启了预加载开关，就在开局执行一次大加载"""
+        if not PRELOAD_GLOBAL_DATA:
+            return
+            
+        self.progress.setLabelText("Global Preloading (Loading all images to RAM)...")
+        self.progress.setMinimumDuration(0)
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.resize(550, 200) 
+        self.progress.setValue(0)
+        self.progress.show()
+        
+        self.preloader = GlobalPreloadThread(
+            self.coord_sys.tiles, 
+            self.root_red, 
+            self.root_green, 
+            self.det_dir
+        )
+        
+        self.preloader.progress_signal.connect(self._update_preload_ui)
+        self.preloader.finished_signal.connect(self._on_preload_finished)
+        self.preloader.start()
+
+    def _update_preload_ui(self, val, text):
+        self.progress.setValue(val)
+        self.progress.setLabelText(text) # 这里会接收到我们拼接好的详尽信息
+
+    def _on_preload_finished(self, cache_dict):
+        """预加载线程结束后的回调"""
+        self.global_image_cache = cache_dict
+        self.progress.close()
+        self.lbl_status.setText("All data preloaded to Memory! You can now click regions instantly.")
+        print(f"[SUCCESS] Global preload finished! Cached {len(cache_dict)} tiles.")
 
     def on_tree_click(self, item, col):
         nid = item.data(0, Qt.UserRole)
@@ -318,13 +352,11 @@ class SimpleAnnotator(QWidget):
         print(f"[DEBUG] Clicked Region: '{region_name}'")
         print(f"[DEBUG] Current Cache Keys: {list(self.region_cache.keys())}")
         
-        # ------------------ 读取缓存逻辑 ------------------
         if region_name in self.region_cache:
             print(f"[DEBUG] 🟢 CACHE HIT! Loading '{region_name}' instantly from memory.")
             self.lbl_status.setText(f"Loaded '{region_name}' from Memory Cache.")
             self.patches_loaded(self.region_cache[region_name])
             return  
-        # --------------------------------------------------
 
         print(f"[DEBUG] 🔴 CACHE MISS! Preparing to crop patches for '{region_name}'...")
         desc_ids = self.ontology.get_all_descendant_ids(nid)
@@ -343,11 +375,10 @@ class SimpleAnnotator(QWidget):
         self.progress.setValue(0)
         self.progress.show()
         
-        self.patch_loader = PatchLoaderThread(anchors, self.coord_sys, self.root_red, self.root_green, self.det_dir)
+        self.patch_loader = PatchLoaderThread(anchors, self.coord_sys, self.root_red, self.root_green,self.det_dir, global_cache=self.global_image_cache)
         self.patch_loader.progress_signal.connect(self.progress.setValue)
         self.patch_loader.finished_signal.connect(self.patches_loaded)
         self.patch_loader.start()
-
 
     def patches_loaded(self, patches):
         self.progress.close()
@@ -357,7 +388,6 @@ class SimpleAnnotator(QWidget):
         if self.current_region_name and self.current_region_name not in self.region_cache:
             print(f"[DEBUG] 💾 SAVING '{self.current_region_name}' TO CACHE. Total patches: {len(patches)}")
             self.region_cache[self.current_region_name] = patches
-        # --------------------------------------------------
             
         self.current_patches = patches
         self.current_idx = 0

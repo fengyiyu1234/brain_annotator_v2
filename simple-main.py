@@ -11,8 +11,8 @@ from src.ontology import Ontology
 
 XML_PATH = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm/xml_merging.xml"
 ONTOLOGY_PATH = "Z:/Fengyi/brain_analysis_6sample/CCF_v3_ontology.json" 
-ROOT_RED = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/561nm"
-ROOT_GREEN = "Z:/Ryan/Light_Sheet_Imaged_Brains/04-08-2025_FW_2/numorph_align/aligned/GFP"
+ROOT_RED = r"f:\fengyi\fw2_downsampled\RFP"
+ROOT_GREEN = r"f:\fengyi\fw2_downsampled\GFP"
 
 # 存放 Detection (9列) 结果的文件夹
 DET_CSV_DIR = "Z:/Fengyi/brain_analysis_6sample/detection_results/fw2/detection_results" 

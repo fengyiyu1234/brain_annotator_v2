@@ -7,7 +7,9 @@ TILE_SHAPE_PX = (2048, 2048)
 
 TYPE_SHORTCUTS = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U']
 COLOR_SHORTCUTS = ['1', '2', '3', '4']
-CELL_SAMPLE_RATIO = 0.10
+CELL_SAMPLE_RATIO = 1
+
+PRELOAD_GLOBAL_DATA = True
 
 # --- Classes Configuration ---
 # 因子 1: 颜色 (0-2)
