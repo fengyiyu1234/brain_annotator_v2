@@ -308,7 +308,8 @@ class PatchLoaderThread(QThread):
             'name': f"{t_prefix}_GZ{int(pt['gz'])}_LZ{center_lz}_GX{int(pt['gx'])}_GY{int(pt['gy'])}",
             'image_stack': img_3d,
             'boxes': boxes,
-            'center_z': center_lz
+            'center_z': center_lz,
+            "label": pt['label']
         }
 
     def run(self):
@@ -319,7 +320,7 @@ class PatchLoaderThread(QThread):
 
         tasks_by_tile_z = {}
         # 🌟 此处严格遵守你原本的 coordinate 转换逻辑，计算出 target_tile 和 local_z (原始 Z)
-        for (gx, gy, gz) in self.anchors:
+        for (gx, gy, gz, label) in self.anchors:
             target_tile = next((t for t in self.tiles if t['abs_x'] <= gx < t['abs_x'] + t['w'] and t['abs_y'] <= gy < t['abs_y'] + t['h']), None)
             if not target_tile: continue
             
@@ -335,7 +336,7 @@ class PatchLoaderThread(QThread):
             
             if key not in tasks_by_tile_z:
                 tasks_by_tile_z[key] = {'tile': target_tile, 'pts': []}
-            tasks_by_tile_z[key]['pts'].append({'lx': lx, 'ly': ly, 'gx': gx, 'gy': gy, 'gz': gz})
+            tasks_by_tile_z[key]['pts'].append({'lx': lx, 'ly': ly, 'gx': gx, 'gy': gy, 'gz': gz, 'label': label})
             
         total_tasks = len(tasks_by_tile_z)
         patches, det_cache, processed = [], {}, 0

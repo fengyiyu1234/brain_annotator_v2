@@ -13,7 +13,7 @@ import time
 import random
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QSplitter, QProgressDialog, 
-                             QApplication, QGroupBox, QShortcut, QSlider)
+                             QApplication, QGroupBox, QShortcut, QSlider,QCheckBox)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
@@ -47,33 +47,49 @@ class SimpleAnnotator(QWidget):
         self.init_ui()
         QTimer.singleShot(100, self.start_indexing)
         
-        # 实时刷新选中框信息的定时器 (100ms)
         self.sel_timer = QTimer(self)
         self.sel_timer.timeout.connect(self.update_info_panel)
         self.sel_timer.start(100)
+        # 实时刷新选中框信息的定时器 (100ms)
+        self.setup_probe_event()
         
-        def _setup_probe_event(self):
-            @self.viewer.mouse_drag_callbacks.append
-            def probe_pixel(viewer, event):
-                if 'Shift' in event.modifiers:
-                    # 必须确保当前有图像加载
-                    if not hasattr(self, 'current_img_stack') or self.current_img_stack is None:
-                        return
-                    pos = event.position
-                    z, y, x = int(pos[0]), int(pos[1]), int(pos[2])
-                    stack = self.current_img_stack
-                    if 0 <= z < stack.shape[0] and 0 <= y < stack.shape[1] and 0 <= x < stack.shape[2]:
-                        val_r = stack[z, y, x, 0]
-                        val_g = stack[z, y, x, 1]
-                        self.lbl_pixel_val.setText(
-                            f"<b>Pixel Probe:<br>"
-                            f"Z:{z} Y:{y} X:{x}<br>"
-                            f"<span style='color:red;'>R: {val_r}</span><br>"
-                            f"<span style='color:green;'>G: {val_g}</span>"
-                        )
-                yield
-            # 执行一次绑定
-            self._setup_probe_event()
+
+    def setup_probe_event(self):
+        """
+        像素探针事件：
+        使用 mouse_move_callbacks (悬停检测)，按住 Shift 移动鼠标即可实时探测。
+        此方法不拦截点击事件，完美保留 Box 的正常点击选中功能。
+        """
+        @self.viewer.mouse_move_callbacks.append
+        def probe_pixel_on_hover(viewer, event):
+            # 只有在按住 Shift 键时才触发探测逻辑，否则直接放行
+            if 'Shift' not in event.modifiers:
+                return
+                
+            # 必须确保当前有图像加载
+            if not hasattr(self, 'current_img_stack') or self.current_img_stack is None:
+                return
+            
+            try:
+                # 获取当前 3D 世界坐标系位置
+                pos = event.position
+                z, y, x = int(pos[0]), int(pos[1]), int(pos[2])
+                stack = self.current_img_stack
+                
+                # 边界检查
+                if 0 <= z < stack.shape[0] and 0 <= y < stack.shape[1] and 0 <= x < stack.shape[2]:
+                    val_r = stack[z, y, x, 0]
+                    val_g = stack[z, y, x, 1]
+                    
+                    self.lbl_pixel_val.setText(
+                        f"<b>Pixel Probe:<br>"
+                        f"Z:{z} Y:{y} X:{x}<br>"
+                        f"<span style='color:red;'>R: {val_r}</span><br>"
+                        f"<span style='color:green;'>G: {val_g}</span>"
+                    )
+            except Exception:
+                # 鼠标移出边界或其他异常时静默处理，不中断界面
+                pass
 
     def init_ui(self):
         self.setWindowTitle("Brain Annotator - 3D Anchor Cropping Mode")
@@ -149,7 +165,7 @@ class SimpleAnnotator(QWidget):
         
         # --- Right Panel ---
         right_panel = QWidget()
-        right_panel.setFixedWidth(380)
+        right_panel.setMinimumWidth(300)
 
         right_panel.setStyleSheet("""
             QLabel { font-size: 15px; }
@@ -169,8 +185,8 @@ class SimpleAnnotator(QWidget):
         self.lbl_info_color = QLabel("Color: --")
         self.lbl_info_conf = QLabel("Conf: --")
         
-        # 【新增】：用于显示探针点击的像素强度
-        self.lbl_pixel_val = QLabel("<b>Pixel Probe:</b> (Hold <b>Shift + Click</b> on image)")
+        # 显示探针点击的像素强度
+        self.lbl_pixel_val = QLabel("<b>Pixel Probe:</b> (Hold <b>Shift)")
         
         # 加粗显示更清晰
         self.lbl_info_file.setWordWrap(True)
@@ -186,6 +202,25 @@ class SimpleAnnotator(QWidget):
         info_grp.setLayout(i_lay)
         r_lay.addWidget(info_grp)
         
+        # class filter
+        self.group_filter = QGroupBox("📊 Class Filter")
+        filter_layout = QVBoxLayout()
+        self.class_checkboxes = {}
+        
+        # 创建 0-5 的勾选框
+        for i in range(6):
+            class_info = CLASS_ID_MAP.get(i, {})
+            # 兼容处理：如果配置字典里有 'name' 则取 'name'，否则显示默认 Class X
+            class_name = class_info.get('name', f"Class {i}") if isinstance(class_info, dict) else f"Class {i}"
+            cb = QCheckBox(f"{class_name}")
+            cb.setChecked(True) # 默认全选
+            cb.stateChanged.connect(self.apply_class_filter) # 勾选状态改变时触发过滤
+            filter_layout.addWidget(cb)
+            self.class_checkboxes[i] = cb
+            
+        self.group_filter.setLayout(filter_layout)
+        r_lay.addWidget(self.group_filter)
+
         # =========================================================
         # 2. Shortcuts (快捷键说明)
         # =========================================================
@@ -364,7 +399,9 @@ class SimpleAnnotator(QWidget):
         
         anchors = []
         for go in target_gos:
-            if go in self.anchor_map: anchors.extend(self.anchor_map[go])
+            if go in self.anchor_map: 
+                for (gx,gy,gz) in self.anchor_map[go]:
+                    anchors.append((gx, gy, gz, go))
                 
         if not anchors:
             self.lbl_status.setText(f"No cells found for {region_name}.")
@@ -388,17 +425,49 @@ class SimpleAnnotator(QWidget):
         if self.current_region_name and self.current_region_name not in self.region_cache:
             print(f"[DEBUG] 💾 SAVING '{self.current_region_name}' TO CACHE. Total patches: {len(patches)}")
             self.region_cache[self.current_region_name] = patches
+            self.all_loaded_patches = patches
+            self.apply_class_filter()
             
-        self.current_patches = patches
+    def apply_class_filter(self):
+        """核心过滤逻辑：根据勾选状态筛选 current_patches"""
+        # 0. 检查“总仓库”是否有数据
+        if not hasattr(self, 'all_loaded_patches') or not self.all_loaded_patches:
+            return
+
+        # 1. 获取当前哪些数字 ID 被勾选了
+        # 注意：这里的 i 是 0-5 的整数，对应我们之前在 __init__ 里存的 key
+        active_labels = [i for i, cb in self.class_checkboxes.items() if cb.isChecked()]
+        
+        # 2. 从总仓库中过滤出符合标签的 Patch
+        self.current_patches = [
+            p for p in self.all_loaded_patches 
+            if 'boxes' in p and any(b.get('cls', -1) in active_labels for b in p['boxes'])
+        ]
+        
+        # 3. 如果过滤后一个都没剩下
+        count = len(self.current_patches)
+        if count == 0:
+            self.lbl_status.setText("No patches match selected filters.")
+            self.slider_patch.setRange(0, 0)
+            self.slider_patch.setValue(0)
+            self.lbl_counter.setText("0 / 0")
+            # 清空当前画布
+            if hasattr(self, 'viewer'):
+                self.viewer.layers.clear()
+            return
+
+        # 4. 重置状态并更新 UI
         self.current_idx = 0
+        self.undo_stack = []
         
         self.slider_patch.blockSignals(True)
-        self.slider_patch.setRange(0, len(patches)-1)
+        self.slider_patch.setRange(0, count - 1)
         self.slider_patch.setValue(0)
         self.slider_patch.blockSignals(False)
         
-        self.undo_stack = []
-        self.lbl_status.setText(f"Loaded {len(patches)} Patches.")
+        self.lbl_status.setText(f"Filter: {count}/{len(self.all_loaded_patches)} shown.")
+        
+        # 5. 立即刷新画面
         self.show_patch()
 
     def show_patch(self):
